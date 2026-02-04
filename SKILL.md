@@ -392,8 +392,10 @@ tmux send-keys -t %5 Enter
 ### Delays Are Essential
 | After | Delay | Why |
 |-------|-------|-----|
-| Escape | 100ms | Prevent `Esc+key` → `M-key` |
+| Escape (single-line) | 100ms | Prevent `Esc+key` → `M-key` |
+| **Escape (multi-line)** | **500ms** | Claude needs more time for multi-line buffer |
 | Text before Enter | 50-100ms | Let buffer flush |
+| After paste-buffer | 200ms | Let tmux buffer sync |
 | Ctrl+C | 200ms | Allow interrupt to process |
 
 **tmux.conf optimization:**
@@ -402,12 +404,78 @@ set-option -sg escape-time 10  # Reduce from 500ms default
 ```
 
 ### Agent Helper Functions
+
 ```bash
-# Claude Code
+# Send multi-line text using tmux buffer (recommended)
+send_multiline() {
+    local pane=$1
+    local text=$2
+    local agent_type=${3:-"other"}  # claude, gemini, codex, other
+
+    # Create temp file and load into tmux buffer
+    local tmpfile=$(mktemp)
+    echo -n "$text" > "$tmpfile"
+    tmux load-buffer "$tmpfile"
+    tmux paste-buffer -t "$pane"
+    rm "$tmpfile"
+
+    sleep 0.2  # Wait after paste
+
+    # Submit based on agent type
+    case "$agent_type" in
+        claude)
+            tmux send-keys -t "$pane" Escape
+            sleep 0.5  # 500ms delay for multi-line
+            tmux send-keys -t "$pane" Enter
+            ;;
+        gemini)
+            tmux send-keys -t "$pane" Escape
+            sleep 0.3
+            tmux send-keys -t "$pane" Enter
+            ;;
+        *)
+            tmux send-keys -t "$pane" Enter
+            ;;
+    esac
+}
+
+# Verify command was executed (check pane is working)
+verify_sent() {
+    local pane=$1
+    sleep 2
+    local content=$(tmux capture-pane -t "$pane" -p -S -5)
+    if echo "$content" | grep -qiE "Working|Creating|writing|Thinking|running|⠋|⠙"; then
+        echo "$pane: ✓ WORKING"
+        return 0
+    elif echo "$content" | grep -qE "bypass|context left|/model|\$ $|> $"; then
+        echo "$pane: ⏳ IDLE (may need retry)"
+        return 1
+    else
+        echo "$pane: ❓ CHECK"
+        return 1
+    fi
+}
+
+# Claude Code (single-line)
 send_claude() {
     tmux send-keys -t "$1" -l "$2"
     sleep 0.1 && tmux send-keys -t "$1" Escape
     sleep 0.1 && tmux send-keys -t "$1" Enter
+}
+
+# Claude Code (multi-line) - use 500ms delay
+send_claude_multi() {
+    local pane=$1
+    local text=$2
+    local tmpfile=$(mktemp)
+    echo -n "$text" > "$tmpfile"
+    tmux load-buffer "$tmpfile"
+    tmux paste-buffer -t "$pane"
+    rm "$tmpfile"
+    sleep 0.2
+    tmux send-keys -t "$pane" Escape
+    sleep 0.5  # Critical: 500ms for multi-line
+    tmux send-keys -t "$pane" Enter
 }
 
 # Other agents (Codex, Gemini, OpenCode)
@@ -754,7 +822,54 @@ wait_for_idle() {
 2. **Use grouped sessions** - For independent window views (`uart` + `uart_dv`)
 3. **Use `tmux send-keys`** - More reliable than AppleScript keystroke for text input
 4. **AppleScript only for window management** - Creating/finding windows, not sending keystrokes
-5. **Delays after Escape** - 100ms minimum to prevent Meta-key interpretation
+5. **Delays after Escape** - 100ms for single-line, **500ms for multi-line** (critical for Claude)
+6. **Use `tmux load-buffer` + `paste-buffer`** - For multi-line text input
+7. **Always verify after send** - Check pane status to confirm command executed
+8. **Gemini sandbox** - Start Gemini from target directory to avoid path restrictions
+
+### Multi-line Text Pattern (Recommended)
+
+```bash
+# Send multi-line prompt to agent
+send_and_verify() {
+    local pane=$1
+    local text=$2
+    local agent=$3  # claude, gemini, codex
+
+    # 1. Check pane is ready before sending
+    local before=$(tmux capture-pane -t "$pane" -p -S -3)
+
+    # 2. Send via buffer (handles multi-line correctly)
+    local tmpfile=$(mktemp)
+    echo -n "$text" > "$tmpfile"
+    tmux load-buffer "$tmpfile"
+    tmux paste-buffer -t "$pane"
+    rm "$tmpfile"
+
+    # 3. Submit with appropriate delay
+    sleep 0.2
+    case "$agent" in
+        claude)
+            tmux send-keys -t "$pane" Escape
+            sleep 0.5  # 500ms for Claude multi-line
+            ;;
+        gemini)
+            tmux send-keys -t "$pane" Escape
+            sleep 0.3
+            ;;
+    esac
+    tmux send-keys -t "$pane" Enter
+
+    # 4. Verify execution started
+    sleep 2
+    local after=$(tmux capture-pane -t "$pane" -p -S -3)
+    if [[ "$before" != "$after" ]]; then
+        echo "✓ $pane: Command sent"
+    else
+        echo "⚠ $pane: May need retry"
+    fi
+}
+```
 
 ### tmux.conf Minimal Setup
 
@@ -778,6 +893,10 @@ set -g set-titles-string "#S.#W"  # Format: session.window
 | Command not run | Missing Enter | Add `Enter` after text |
 | Keystrokes to wrong window | AppleScript keystroke | Use `tmux send-keys` for tmux panes |
 | Tab creation fails | AppleScript limitation | Use separate windows |
+| **Multi-line not submitted** | Escape delay too short | Use **500ms** delay before Enter for Claude |
+| Multi-line text garbled | Using send-keys -l | Use `load-buffer` + `paste-buffer` instead |
+| Gemini can't write files | Sandbox restriction | Start Gemini from target directory |
+| Command not executed | No verification | Always check pane after send |
 
 ---
 
