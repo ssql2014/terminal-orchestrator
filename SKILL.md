@@ -403,87 +403,36 @@ tmux send-keys -t %5 Enter
 set-option -sg escape-time 10  # Reduce from 500ms default
 ```
 
-### Agent Helper Functions
+### Sending Text to Agents
+
+**Single-line text**: Use `tmux send-keys -t <pane> -l "text"` then `Enter`
+
+**Multi-line text**: Use `tmux load-buffer` + `paste-buffer` (避免换行符被解释为 Enter)
 
 ```bash
-# Send multi-line text using tmux buffer (recommended)
-send_multiline() {
-    local pane=$1
-    local text=$2
-    local agent_type=${3:-"other"}  # claude, gemini, codex, other
-
-    # Create temp file and load into tmux buffer
-    local tmpfile=$(mktemp)
-    echo -n "$text" > "$tmpfile"
-    tmux load-buffer "$tmpfile"
-    tmux paste-buffer -t "$pane"
-    rm "$tmpfile"
-
-    sleep 0.2  # Wait after paste
-
-    # Submit based on agent type
-    case "$agent_type" in
-        claude)
-            tmux send-keys -t "$pane" Escape
-            sleep 0.5  # 500ms delay for multi-line
-            tmux send-keys -t "$pane" Enter
-            ;;
-        gemini)
-            tmux send-keys -t "$pane" Escape
-            sleep 0.3
-            tmux send-keys -t "$pane" Enter
-            ;;
-        *)
-            tmux send-keys -t "$pane" Enter
-            ;;
-    esac
-}
-
-# Verify command was executed (check pane is working)
-verify_sent() {
-    local pane=$1
-    sleep 2
-    local content=$(tmux capture-pane -t "$pane" -p -S -5)
-    if echo "$content" | grep -qiE "Working|Creating|writing|Thinking|running|⠋|⠙"; then
-        echo "$pane: ✓ WORKING"
-        return 0
-    elif echo "$content" | grep -qE "bypass|context left|/model|\$ $|> $"; then
-        echo "$pane: ⏳ IDLE (may need retry)"
-        return 1
-    else
-        echo "$pane: ❓ CHECK"
-        return 1
-    fi
-}
-
-# Claude Code (single-line)
-send_claude() {
-    tmux send-keys -t "$1" -l "$2"
-    sleep 0.1 && tmux send-keys -t "$1" Escape
-    sleep 0.1 && tmux send-keys -t "$1" Enter
-}
-
-# Claude Code (multi-line) - use 500ms delay
-send_claude_multi() {
-    local pane=$1
-    local text=$2
-    local tmpfile=$(mktemp)
-    echo -n "$text" > "$tmpfile"
-    tmux load-buffer "$tmpfile"
-    tmux paste-buffer -t "$pane"
-    rm "$tmpfile"
-    sleep 0.2
-    tmux send-keys -t "$pane" Escape
-    sleep 0.5  # Critical: 500ms for multi-line
-    tmux send-keys -t "$pane" Enter
-}
-
-# Other agents (Codex, Gemini, OpenCode)
-send_agent() {
-    tmux send-keys -t "$1" -l "$2"
-    sleep 0.05 && tmux send-keys -t "$1" Enter
-}
+# Multi-line pattern
+tmpfile=$(mktemp)
+echo -n "$text" > "$tmpfile"
+tmux load-buffer "$tmpfile"
+tmux paste-buffer -t "$pane"
+rm "$tmpfile"
 ```
+
+### Agent Submit Patterns
+
+| Agent | Submit Sequence | Delay |
+|-------|-----------------|-------|
+| **Claude Code** | text → `Escape` → **500ms** → `Enter` | 500ms before Enter (critical for multi-line) |
+| **Gemini CLI** | text → `Escape` → 300ms → `Enter` | 300ms, also needs Escape |
+| **Codex CLI** | text → `Enter` | No Escape needed |
+| **OpenCode** | text → `Enter` | No Escape needed |
+
+### Verification (发送后检查)
+
+发送命令后，用 `tmux capture-pane` 检查 pane 内容变化：
+- **Working**: 看到 "Thinking", "Creating", "Writing", spinner 等
+- **Idle**: 看到 prompt (`> `, `$ `, `context left`)
+- **Error**: 内容没变化，需要重试
 
 ### Wait-for Synchronization
 ```bash
@@ -827,49 +776,19 @@ wait_for_idle() {
 7. **Always verify after send** - Check pane status to confirm command executed
 8. **Gemini sandbox** - Start Gemini from target directory to avoid path restrictions
 
-### Multi-line Text Pattern (Recommended)
+### Multi-line Text Workflow
 
-```bash
-# Send multi-line prompt to agent
-send_and_verify() {
-    local pane=$1
-    local text=$2
-    local agent=$3  # claude, gemini, codex
+发送多行文本到 agent 的步骤：
 
-    # 1. Check pane is ready before sending
-    local before=$(tmux capture-pane -t "$pane" -p -S -3)
+1. **发送前检查** - 用 `tmux capture-pane` 记录当前内容
+2. **使用 buffer 发送** - `load-buffer` + `paste-buffer` 避免换行问题
+3. **按 agent 类型提交**:
+   - Claude: `Escape` → 等待 **500ms** → `Enter`
+   - Gemini: `Escape` → 等待 300ms → `Enter`
+   - Codex/其他: 直接 `Enter`
+4. **发送后验证** - 再次 `capture-pane`，对比内容是否变化
 
-    # 2. Send via buffer (handles multi-line correctly)
-    local tmpfile=$(mktemp)
-    echo -n "$text" > "$tmpfile"
-    tmux load-buffer "$tmpfile"
-    tmux paste-buffer -t "$pane"
-    rm "$tmpfile"
-
-    # 3. Submit with appropriate delay
-    sleep 0.2
-    case "$agent" in
-        claude)
-            tmux send-keys -t "$pane" Escape
-            sleep 0.5  # 500ms for Claude multi-line
-            ;;
-        gemini)
-            tmux send-keys -t "$pane" Escape
-            sleep 0.3
-            ;;
-    esac
-    tmux send-keys -t "$pane" Enter
-
-    # 4. Verify execution started
-    sleep 2
-    local after=$(tmux capture-pane -t "$pane" -p -S -3)
-    if [[ "$before" != "$after" ]]; then
-        echo "✓ $pane: Command sent"
-    else
-        echo "⚠ $pane: May need retry"
-    fi
-}
-```
+如果内容没变化，说明命令没执行成功，需要重试。
 
 ### tmux.conf Minimal Setup
 
