@@ -54,6 +54,94 @@ tmux select-window -t "uart_dv:dv"
 | **tmux pane** | `session.tmux.window.pane` | `uart.tmux.dv.tx` |
 | **terminal window** | `session.terminal.name` | `uart.terminal.debug` |
 
+### Relative Position Addressing (相对位置查找)
+
+除了用名字查找 pane，还可以用相对位置查找。这在多 pane 布局中非常有用。
+
+| Direction | tmux Flag | Description |
+|-----------|-----------|-------------|
+| **上** | `-U` | 当前 pane 上方 |
+| **下** | `-D` | 当前 pane 下方 |
+| **左** | `-L` | 当前 pane 左边 |
+| **右** | `-R` | 当前 pane 右边 |
+
+```bash
+# 查找相对位置的 pane ID
+get_relative_pane() {
+    local direction=$1  # U, D, L, R
+    local current=${2:-}  # 可选：从指定 pane 开始，默认当前 pane
+
+    if [[ -n "$current" ]]; then
+        tmux select-pane -t "$current"
+    fi
+
+    # 临时选择目标 pane 并获取 ID
+    local target_id=$(tmux display-message -p -t "{$direction}" '#{pane_id}' 2>/dev/null)
+    echo "$target_id"
+}
+
+# 发送到相对位置的 pane
+send_relative() {
+    local direction=$1  # up, down, left, right
+    local text=$2
+
+    local flag=""
+    case "$direction" in
+        up|above)    flag="U" ;;
+        down|below)  flag="D" ;;
+        left)        flag="L" ;;
+        right)       flag="R" ;;
+    esac
+
+    local target=$(tmux display-message -p -t "{$flag}" '#{pane_id}' 2>/dev/null)
+    if [[ -n "$target" ]]; then
+        tmux send-keys -t "$target" -l "$text"
+        tmux send-keys -t "$target" Enter
+        echo "→ sent to $direction ($target)"
+    else
+        echo "✗ No pane $direction"
+    fi
+}
+
+# Usage
+send_relative up "fix the bug"      # 发送到上方 pane
+send_relative left "run tests"      # 发送到左边 pane
+```
+
+**组合方向**: 对于左上、右下等对角位置，需要两步查找：
+
+```bash
+# 查找对角 pane (如：左上)
+get_diagonal_pane() {
+    local v_dir=$1  # U or D (up/down first)
+    local h_dir=$2  # L or R (then left/right)
+
+    # 先垂直移动，再水平移动
+    local mid=$(tmux display-message -p -t "{$v_dir}" '#{pane_id}' 2>/dev/null)
+    if [[ -n "$mid" ]]; then
+        tmux display-message -p -t "$mid" -t "{$h_dir}" '#{pane_id}' 2>/dev/null
+    fi
+}
+
+# 左上 = up + left
+top_left=$(get_diagonal_pane U L)
+
+# 右下 = down + right
+bottom_right=$(get_diagonal_pane D R)
+```
+
+**列出所有 pane 位置**:
+
+```bash
+# 显示 pane 布局坐标
+tmux list-panes -F '#{pane_id} #{pane_title} (#{pane_left},#{pane_top}) #{pane_width}x#{pane_height}'
+
+# Output:
+# %0 tx (0,0) 80x12
+# %1 rx (81,0) 80x12
+# %2 monitor (0,13) 161x12
+```
+
 ### Hierarchy
 
 | Level | tmux | Terminal.app |
