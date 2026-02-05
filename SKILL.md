@@ -51,8 +51,171 @@ tmux select-window -t "uart_dv:dv"
 
 | Type | Format | Example |
 |------|--------|---------|
-| **tmux pane** | `session.tmux.window.pane` | `uart.tmux.dv.tx` |
+| **tmux pane (local)** | `session.tmux.window.pane` | `uart.tmux.dv.tx` |
+| **tmux pane (remote)** | `session.tmux.window.pane@host` | `uart.tmux.dv.tx@ist-mac-s` |
 | **terminal window** | `session.terminal.name` | `uart.terminal.debug` |
+
+### Remote Addressing: `@host` 后缀
+
+像 email 一样命名 agent：`agent@location`
+
+```
+uart.tmux.design.tx              → 本机
+uart.tmux.design.tx@ist-mac-s    → ist-mac-s 服务器
+uart.tmux.design.tx@192.168.1.5  → IP 地址
+uart.tmux.design.tx@cloud-vm     → SSH config 中的 Host 别名
+```
+
+**前提条件**: SSH key 已配置 (见 `~/.ssh/config`)
+
+**地址解析**:
+
+```bash
+parse_addr() {
+    local full_addr=$1
+    local addr host
+
+    if [[ "$full_addr" == *"@"* ]]; then
+        addr="${full_addr%@*}"    # @ 前面的部分
+        host="${full_addr#*@}"    # @ 后面的部分
+    else
+        addr="$full_addr"
+        host=""  # 空 = 本机
+    fi
+
+    echo "$addr $host"
+}
+
+# Usage
+read addr host <<< $(parse_addr "uart.tmux.design.tx@ist-mac-s")
+# addr = "uart.tmux.design.tx"
+# host = "ist-mac-s"
+```
+
+**远程执行**:
+
+```bash
+# 本地 tmux 命令
+tmux send-keys -t "$pane_id" -l "hello"
+
+# 远程 tmux 命令 (通过 SSH)
+ssh "$host" "tmux send-keys -t '$pane_id' -l 'hello'"
+```
+
+**通用 send 函数 (支持远程)**:
+
+```bash
+send() {
+    local full_addr=$1
+    local text=$2
+
+    # 解析 @host
+    local addr host
+    if [[ "$full_addr" == *"@"* ]]; then
+        addr="${full_addr%@*}"
+        host="${full_addr#*@}"
+    else
+        addr="$full_addr"
+        host=""
+    fi
+
+    IFS='.' read -r session type window pane <<< "$addr"
+
+    case "$type" in
+        tmux)
+            local cmd="tmux send-keys -t '$session:$window.$pane' -l '$text' && tmux send-keys -t '$session:$window.$pane' Enter"
+
+            if [[ -n "$host" ]]; then
+                ssh "$host" "$cmd"
+            else
+                eval "$cmd"
+            fi
+            echo "→ $full_addr: sent"
+            ;;
+    esac
+}
+
+# Usage
+send "uart.tmux.design.tx" "hello"              # 本机
+send "uart.tmux.design.tx@ist-mac-s" "hello"    # 远程
+```
+
+**读取远程 pane**:
+
+```bash
+read_from() {
+    local full_addr=$1
+    local lines=${2:-30}
+
+    local addr host
+    if [[ "$full_addr" == *"@"* ]]; then
+        addr="${full_addr%@*}"
+        host="${full_addr#*@}"
+    else
+        addr="$full_addr"
+        host=""
+    fi
+
+    IFS='.' read -r session type window pane <<< "$addr"
+
+    local cmd="tmux capture-pane -t '$session:$window.$pane' -p -S -$lines"
+
+    if [[ -n "$host" ]]; then
+        ssh "$host" "$cmd"
+    else
+        eval "$cmd"
+    fi
+}
+```
+
+### 通用 Agent 命名哲学
+
+类似互联网进程命名 (URI/DNS)，agent 地址遵循：
+
+```
+[protocol://]path@host[:port]
+
+tmux://uart.design.tx@ist-mac-s      # 完整 URI (可选)
+uart.tmux.design.tx@ist-mac-s        # 简化格式 (推荐)
+uart.tmux.design.tx                  # 本机简写
+```
+
+**命名层级**:
+
+| 层级 | 作用 | 示例 |
+|------|------|------|
+| **Host** | 机器位置 | `@ist-mac-s`, `@192.168.1.5` |
+| **Session** | 项目/任务组 | `uart`, `webapp` |
+| **Type** | 运行环境 | `tmux`, `terminal` |
+| **Window** | 功能分区 | `design`, `dv`, `debug` |
+| **Pane** | 具体 agent | `tx`, `rx`, `main` |
+
+**跨机器 agent 列表**:
+
+```bash
+agents_all() {
+    local hosts=("" "ist-mac-s" "cloud-vm")  # "" = 本机
+
+    for host in "${hosts[@]}"; do
+        local prefix=""
+        [[ -n "$host" ]] && prefix="@$host"
+
+        local cmd="tmux list-panes -a -F '#{session_name}.tmux.#{window_name}.#{pane_title}'"
+
+        if [[ -n "$host" ]]; then
+            ssh "$host" "$cmd" 2>/dev/null | sed "s/$/$prefix/"
+        else
+            eval "$cmd" | sed "s/$/  (local)/"
+        fi
+    done
+}
+
+# Output:
+# uart.tmux.design.tx  (local)
+# uart.tmux.design.rx  (local)
+# uart.tmux.dv.tx@ist-mac-s
+# uart.tmux.dv.rx@ist-mac-s
+```
 
 ### Relative Position Addressing (相对位置查找)
 
