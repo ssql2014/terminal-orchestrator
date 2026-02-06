@@ -3,1112 +3,224 @@ name: terminal-orchestrator
 description: AI agent orchestration via tmux and Terminal.app. Battle-tested patterns for multi-agent terminal control.
 ---
 
-# Terminal & tmux Control
+# Terminal & tmux Agent Orchestration
 
-Minimal, battle-tested patterns for mutual control between terminals and tmux.
+Control AI agents (Claude, Gemini, Codex, etc.) running in tmux panes and Terminal.app windows. This document teaches the **concepts and gotchas** — generate the actual commands yourself.
 
 ---
 
-## Architecture: One tmux Window = One Terminal Window
-
-**Important**: Terminal.app tab creation via AppleScript is unreliable. Use separate Terminal windows instead.
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│  Terminal Windows (each attached to a tmux grouped session)                 │
-│                                                                             │
-│  ┌─────────────────────┐  ┌─────────────────────┐  ┌─────────────────────┐  │
-│  │ uart.design         │  │ uart.dv             │  │ uart.debug          │  │
-│  │ (tmux: uart)        │  │ (tmux: uart_dv)     │  │ (standalone)        │  │
-│  ├──────────┬──────────┤  ├──────────┬──────────┤  ├─────────────────────┤  │
-│  │ tx       │ rx       │  │ tx       │ rx       │  │                     │  │
-│  │ (Gemini) │ (Codex)  │  │ (Claude) │ (Codex)  │  │ Claude              │  │
-│  │          │          │  │          │          │  │                     │  │
-│  └──────────┴──────────┘  └──────────┴──────────┘  └─────────────────────┘  │
-│   uart.tmux.design.tx      uart.tmux.dv.tx         uart.terminal.debug     │
-│   uart.tmux.design.rx      uart.tmux.dv.rx                                  │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
-
-### Grouped Sessions for Independent Window Views
-
-tmux sessions share windows. To show different windows in different terminals:
-- Main session: `uart` (owns the windows)
-- Grouped session: `uart_dv` (shares windows, can select different one)
-
-```bash
-# Create grouped session
-tmux new-session -d -t "uart" -s "uart_dv"
-tmux select-window -t "uart_dv:dv"
-```
-
-## Naming Convention: `session.{tmux|terminal}.window[.pane]`
-
-> **Note**: `uart`, `design`, `dv` 等都是示例名称，实际使用时替换为你的项目/任务名。
-> 例如：`myproject.tmux.dev.main`, `webapp.tmux.frontend.editor`
-
-### Address = Location (命令单独指定)
-
-| Type | Format | Example |
-|------|--------|---------|
-| **tmux pane (local)** | `session.tmux.window.pane` | `uart.tmux.dv.tx` |
-| **tmux pane (remote)** | `session.tmux.window.pane@host` | `uart.tmux.dv.tx@ist-mac-s` |
-| **terminal window** | `session.terminal.name` | `uart.terminal.debug` |
-
-### Remote Addressing: `@host` 后缀
-
-像 email 一样命名 agent：`agent@location`
-
-```
-uart.tmux.design.tx              → 本机
-uart.tmux.design.tx@ist-mac-s    → ist-mac-s 服务器
-uart.tmux.design.tx@192.168.1.5  → IP 地址
-uart.tmux.design.tx@cloud-vm     → SSH config 中的 Host 别名
-```
-
-**前提条件**: SSH key 已配置 (见 `~/.ssh/config`)
-
-**地址解析**:
-
-```bash
-parse_addr() {
-    local full_addr=$1
-    local addr host
-
-    if [[ "$full_addr" == *"@"* ]]; then
-        addr="${full_addr%@*}"    # @ 前面的部分
-        host="${full_addr#*@}"    # @ 后面的部分
-    else
-        addr="$full_addr"
-        host=""  # 空 = 本机
-    fi
-
-    echo "$addr $host"
-}
-
-# Usage
-read addr host <<< $(parse_addr "uart.tmux.design.tx@ist-mac-s")
-# addr = "uart.tmux.design.tx"
-# host = "ist-mac-s"
-```
-
-**远程执行**:
-
-```bash
-# 本地 tmux 命令
-tmux send-keys -t "$pane_id" -l "hello"
-
-# 远程 tmux 命令 (通过 SSH)
-ssh "$host" "tmux send-keys -t '$pane_id' -l 'hello'"
-```
-
-**通用 send 函数 (支持远程)**:
-
-```bash
-send() {
-    local full_addr=$1
-    local text=$2
-
-    # 解析 @host
-    local addr host
-    if [[ "$full_addr" == *"@"* ]]; then
-        addr="${full_addr%@*}"
-        host="${full_addr#*@}"
-    else
-        addr="$full_addr"
-        host=""
-    fi
-
-    IFS='.' read -r session type window pane <<< "$addr"
-
-    case "$type" in
-        tmux)
-            local cmd="tmux send-keys -t '$session:$window.$pane' -l '$text' && tmux send-keys -t '$session:$window.$pane' Enter"
-
-            if [[ -n "$host" ]]; then
-                ssh "$host" "$cmd"
-            else
-                eval "$cmd"
-            fi
-            echo "→ $full_addr: sent"
-            ;;
-    esac
-}
-
-# Usage
-send "uart.tmux.design.tx" "hello"              # 本机
-send "uart.tmux.design.tx@ist-mac-s" "hello"    # 远程
-```
-
-**读取远程 pane**:
-
-```bash
-read_from() {
-    local full_addr=$1
-    local lines=${2:-30}
-
-    local addr host
-    if [[ "$full_addr" == *"@"* ]]; then
-        addr="${full_addr%@*}"
-        host="${full_addr#*@}"
-    else
-        addr="$full_addr"
-        host=""
-    fi
-
-    IFS='.' read -r session type window pane <<< "$addr"
-
-    local cmd="tmux capture-pane -t '$session:$window.$pane' -p -S -$lines"
-
-    if [[ -n "$host" ]]; then
-        ssh "$host" "$cmd"
-    else
-        eval "$cmd"
-    fi
-}
-```
-
-### 通用 Agent 命名哲学
-
-类似互联网进程命名 (URI/DNS)，agent 地址遵循：
-
-```
-[protocol://]path@host[:port]
-
-tmux://uart.design.tx@ist-mac-s      # 完整 URI (可选)
-uart.tmux.design.tx@ist-mac-s        # 简化格式 (推荐)
-uart.tmux.design.tx                  # 本机简写
-```
-
-**命名层级**:
-
-| 层级 | 作用 | 示例 |
-|------|------|------|
-| **Host** | 机器位置 | `@ist-mac-s`, `@192.168.1.5` |
-| **Session** | 项目/任务组 | `uart`, `webapp` |
-| **Type** | 运行环境 | `tmux`, `terminal` |
-| **Window** | 功能分区 | `design`, `dv`, `debug` |
-| **Pane** | 具体 agent | `tx`, `rx`, `main` |
-
-**跨机器 agent 列表**:
-
-```bash
-agents_all() {
-    local hosts=("" "ist-mac-s" "cloud-vm")  # "" = 本机
-
-    for host in "${hosts[@]}"; do
-        local prefix=""
-        [[ -n "$host" ]] && prefix="@$host"
-
-        local cmd="tmux list-panes -a -F '#{session_name}.tmux.#{window_name}.#{pane_title}'"
-
-        if [[ -n "$host" ]]; then
-            ssh "$host" "$cmd" 2>/dev/null | sed "s/$/$prefix/"
-        else
-            eval "$cmd" | sed "s/$/  (local)/"
-        fi
-    done
-}
-
-# Output:
-# uart.tmux.design.tx  (local)
-# uart.tmux.design.rx  (local)
-# uart.tmux.dv.tx@ist-mac-s
-# uart.tmux.dv.rx@ist-mac-s
-```
-
-### Relative Position Addressing (相对位置查找)
-
-除了用名字查找 pane，还可以用相对位置查找。这在多 pane 布局中非常有用。
-
-| Direction | tmux Flag | Description |
-|-----------|-----------|-------------|
-| **上** | `-U` | 当前 pane 上方 |
-| **下** | `-D` | 当前 pane 下方 |
-| **左** | `-L` | 当前 pane 左边 |
-| **右** | `-R` | 当前 pane 右边 |
-
-```bash
-# 查找相对位置的 pane ID
-get_relative_pane() {
-    local direction=$1  # U, D, L, R
-    local current=${2:-}  # 可选：从指定 pane 开始，默认当前 pane
-
-    if [[ -n "$current" ]]; then
-        tmux select-pane -t "$current"
-    fi
-
-    # 临时选择目标 pane 并获取 ID
-    local target_id=$(tmux display-message -p -t "{$direction}" '#{pane_id}' 2>/dev/null)
-    echo "$target_id"
-}
-
-# 发送到相对位置的 pane
-send_relative() {
-    local direction=$1  # up, down, left, right
-    local text=$2
-
-    local flag=""
-    case "$direction" in
-        up|above)    flag="U" ;;
-        down|below)  flag="D" ;;
-        left)        flag="L" ;;
-        right)       flag="R" ;;
-    esac
-
-    local target=$(tmux display-message -p -t "{$flag}" '#{pane_id}' 2>/dev/null)
-    if [[ -n "$target" ]]; then
-        tmux send-keys -t "$target" -l "$text"
-        tmux send-keys -t "$target" Enter
-        echo "→ sent to $direction ($target)"
-    else
-        echo "✗ No pane $direction"
-    fi
-}
-
-# Usage
-send_relative up "fix the bug"      # 发送到上方 pane
-send_relative left "run tests"      # 发送到左边 pane
-```
-
-**组合方向**: 对于左上、右下等对角位置，需要两步查找：
-
-```bash
-# 查找对角 pane (如：左上)
-get_diagonal_pane() {
-    local v_dir=$1  # U or D (up/down first)
-    local h_dir=$2  # L or R (then left/right)
-
-    # 先垂直移动，再水平移动
-    local mid=$(tmux display-message -p -t "{$v_dir}" '#{pane_id}' 2>/dev/null)
-    if [[ -n "$mid" ]]; then
-        tmux display-message -p -t "$mid" -t "{$h_dir}" '#{pane_id}' 2>/dev/null
-    fi
-}
-
-# 左上 = up + left
-top_left=$(get_diagonal_pane U L)
-
-# 右下 = down + right
-bottom_right=$(get_diagonal_pane D R)
-```
-
-**列出所有 pane 位置**:
-
-```bash
-# 显示 pane 布局坐标
-tmux list-panes -F '#{pane_id} #{pane_title} (#{pane_left},#{pane_top}) #{pane_width}x#{pane_height}'
-
-# Output:
-# %0 tx (0,0) 80x12
-# %1 rx (81,0) 80x12
-# %2 monitor (0,13) 161x12
-```
-
-### Hierarchy
-
-| Level | tmux | Terminal.app |
-|-------|------|--------------|
-| **Session** | tmux session (+ grouped sessions) | N/A |
-| **Window** | tmux window | Terminal window (title: `session.window`) |
-| **Pane** | tmux pane (named) | N/A |
+## Addressing Convention
+
+Every agent has a dot-separated address: `session.type.window[.pane][@host]`
+
+| Part | Meaning | Example |
+|------|---------|---------|
+| **session** | Project/task group | `uart`, `webapp` |
+| **type** | Runtime: `tmux` or `terminal` | `tmux` |
+| **window** | Functional area | `design`, `dv`, `debug` |
+| **pane** | Specific agent (tmux only) | `tx`, `rx`, `main` |
+| **@host** | Remote machine (optional) | `@ist-mac-s`, `@192.168.1.5` |
+
+Examples:
+- `uart.tmux.design.tx` — local tmux pane
+- `uart.tmux.design.tx@ist-mac-s` — remote tmux pane (via SSH)
+- `uart.terminal.debug` — standalone Terminal.app window
+
+Parse by splitting on `.` for the address parts and `@` for the host. Like email: `agent@location`.
 
 ---
 
-## Part 0: Core Commands
-
-### `run` - Launch command at address (auto-opens Terminal)
-
-```bash
-run() {
-    local cmd=$1
-    local addr=$2
-    IFS='.' read -r session type window pane <<< "$addr"
-
-    case "$type" in
-        tmux)
-            # 1. Create main session if needed
-            if ! tmux has-session -t "$session" 2>/dev/null; then
-                tmux new-session -d -s "$session" -n "$window"
-            fi
-
-            # 2. Create window if needed
-            if ! tmux list-windows -t "$session" -F '#{window_name}' | grep -qx "$window"; then
-                tmux new-window -t "$session" -n "$window"
-            fi
-
-            # 3. Find or create pane
-            local target="$session:$window"
-            local pane_id=$(tmux list-panes -t "$target" -F '#{pane_title} #{pane_id}' 2>/dev/null | grep "^$pane " | awk '{print $2}')
-
-            if [[ -z "$pane_id" ]]; then
-                local count=$(tmux list-panes -t "$target" 2>/dev/null | wc -l | tr -d ' ')
-                if [[ "$count" -le 1 ]]; then
-                    pane_id=$(tmux list-panes -t "$target" -F '#{pane_id}' | head -1)
-                else
-                    pane_id=$(tmux split-window -t "$target" -h -P -F '#{pane_id}')
-                fi
-                tmux select-pane -t "$pane_id" -T "$pane"
-            fi
-
-            # 4. Run command
-            tmux send-keys -t "$pane_id" -l "$cmd"
-            sleep 0.05
-            tmux send-keys -t "$pane_id" Enter
-
-            # 5. Create grouped session for this window (enables independent view)
-            local grouped_session="${session}_${window}"
-            if ! tmux has-session -t "$grouped_session" 2>/dev/null; then
-                tmux new-session -d -t "$session" -s "$grouped_session"
-            fi
-            tmux select-window -t "$grouped_session:$window"
-
-            # 6. Auto-open Terminal window (one per tmux window)
-            if [[ -z "$TMUX" ]]; then
-                local term_title="$session.$window"
-                osascript <<EOF
-tell application "Terminal"
-    set targetWindow to missing value
-    repeat with w in windows
-        try
-            if (custom title of w) is "$term_title" then
-                set targetWindow to w
-                exit repeat
-            end if
-        end try
-    end repeat
-
-    if targetWindow is missing value then
-        set newWin to do script "tmux attach -t $grouped_session"
-        delay 1
-        set custom title of front window to "$term_title"
-        set custom title of selected tab of front window to "$term_title"
-    else
-        set frontmost of targetWindow to true
-    end if
-    activate
-end tell
-EOF
-            fi
-
-            echo "→ $addr ($pane_id): $cmd"
-            ;;
-
-        terminal)
-            # Standalone Terminal window (no tmux)
-            local term_title="$session.$window"
-            osascript <<EOF
-tell application "Terminal"
-    set targetWindow to missing value
-    repeat with w in windows
-        try
-            if (custom title of w) is "$term_title" then
-                set targetWindow to w
-                exit repeat
-            end if
-        end try
-    end repeat
-
-    if targetWindow is missing value then
-        set newWin to do script "$cmd"
-        delay 1
-        set custom title of front window to "$term_title"
-        set custom title of selected tab of front window to "$term_title"
-    else
-        set frontmost of targetWindow to true
-    end if
-    activate
-end tell
-EOF
-            echo "→ $addr: $cmd"
-            ;;
-    esac
-}
-```
-
-### `send` - Send text to address
-
-```bash
-send() {
-    local addr=$1
-    local text=$2
-    IFS='.' read -r session type window pane <<< "$addr"
-
-    case "$type" in
-        tmux)
-            local pane_id=$(tmux list-panes -t "$session:$window" -F '#{pane_title} #{pane_id}' | grep "^$pane " | awk '{print $2}')
-            [[ -z "$pane_id" ]] && { echo "Not found: $addr"; return 1; }
-
-            tmux send-keys -t "$pane_id" -l "$text"
-            sleep 0.1
-
-            # Claude needs Esc+Return
-            local content=$(tmux capture-pane -t "$pane_id" -p -S -5)
-            if echo "$content" | grep -qiE 'claude|Claude Code'; then
-                tmux send-keys -t "$pane_id" Escape
-                sleep 0.1
-            fi
-            tmux send-keys -t "$pane_id" Enter
-            echo "→ $addr: sent"
-            ;;
-
-        terminal)
-            osascript -e "
-                set the clipboard to \"$text\"
-                tell application \"Terminal\" to activate
-                delay 0.1
-                tell application \"System Events\" to keystroke \"v\" using command down
-                delay 0.05
-                tell application \"System Events\" to keystroke return
-            "
-            echo "→ $addr: sent"
-            ;;
-    esac
-}
-```
-
-### `read_from` - Read content from address
-
-```bash
-read_from() {
-    local addr=$1
-    local lines=${2:-30}
-    IFS='.' read -r session type window pane <<< "$addr"
-
-    case "$type" in
-        tmux)
-            local pane_id=$(tmux list-panes -t "$session:$window" -F '#{pane_title} #{pane_id}' | grep "^$pane " | awk '{print $2}')
-            tmux capture-pane -t "$pane_id" -p -S -"$lines"
-            ;;
-        terminal)
-            osascript -e 'tell application "Terminal" to get contents of selected tab of front window'
-            ;;
-    esac
-}
-```
-
-### `kill_addr` - Kill pane, window, or session
-
-```bash
-kill_addr() {
-    local addr=$1
-    IFS='.' read -r session type window pane <<< "$addr"
-
-    if [[ -n "$pane" ]]; then
-        # Kill pane: uart.tmux.dv.tx
-        local pane_id=$(tmux list-panes -t "$session:$window" -F '#{pane_title} #{pane_id}' 2>/dev/null | grep "^$pane " | awk '{print $2}')
-        if [[ -n "$pane_id" ]]; then
-            tmux kill-pane -t "$pane_id"
-            echo "✓ Killed pane $addr"
-        else
-            echo "✗ Pane not found: $addr"
-        fi
-    elif [[ -n "$window" ]]; then
-        # Kill window: uart.tmux.dv
-        tmux kill-window -t "$session:$window" 2>/dev/null && echo "✓ Killed window $addr" || echo "✗ Window not found: $addr"
-    else
-        # Kill session: uart.tmux
-        tmux kill-session -t "$session" 2>/dev/null && echo "✓ Killed session $session" || echo "✗ Session not found: $session"
-    fi
-}
-```
-
-### `attach` - Open terminal attached to tmux session
-
-```bash
-attach() {
-    local session=$1
-    osascript -e "tell application \"Terminal\" to do script \"tmux attach -t $session || tmux new -s $session\""
-}
-```
-
-### Usage
-
-```bash
-# Run command at address (auto-creates session/window/pane + opens Terminal)
-run "codex" "uart.tmux.design.tx"
-run "claude" "uart.tmux.design.rx"
-run "htop" "myapp.terminal.monitor"
-
-# Send text/prompt to address
-send "uart.tmux.design.tx" "fix the bug"
-
-# Read output from address
-read_from "uart.tmux.design.tx" 50
-
-# Kill (pane/window/session based on address depth)
-kill_addr "uart.tmux.design.tx"   # kill pane
-kill_addr "uart.tmux.design"      # kill window
-kill_addr "uart.tmux"             # kill session
-
-# Attach terminal to session
-attach "uart"
-```
-```
-
-### `agents` - List all panes with status
-
-```bash
-agents() {
-    echo "┌────────────────────────────────┬────────┬──────────┬──────────────┐"
-    echo "│ Address                        │ Pane   │ Status   │ Last Line    │"
-    echo "├────────────────────────────────┼────────┼──────────┼──────────────┤"
-
-    tmux list-panes -a -F '#{session_name} #{window_name} #{pane_title} #{pane_id}' 2>/dev/null | while read session window pane pane_id; do
-        local addr="$session.tmux.$window.$pane"
-        local last=$(tmux capture-pane -t "$pane_id" -p -S -1 | tail -1 | cut -c1-12)
-        local content=$(tmux capture-pane -t "$pane_id" -p -S -5)
-        local state="busy"
-        echo "$content" | grep -qE '^> $|^\$ $' && state="idle"
-        echo "$content" | grep -qE '\[y/n\]|!' && state="waiting"
-        printf "│ %-30s │ %-6s │ %-8s │ %-12s │\n" "$addr" "$pane_id" "$state" "$last"
-    done
-
-    echo "└────────────────────────────────┴────────┴──────────┴──────────────┘"
-}
-```
-
-### Output
+## Architecture
 
 ```
-┌────────────────────────────────┬────────┬──────────┬──────────────┐
-│ Address                        │ Pane   │ Status   │ Last Line    │
-├────────────────────────────────┼────────┼──────────┼──────────────┤
-│ uart.tmux.dv.tx                │ %1     │ idle     │ >            │
-│ uart.tmux.dv.rx                │ %2     │ busy     │ Thinking...  │
-└────────────────────────────────┴────────┴──────────┴──────────────┘
+ Terminal Windows (each attached to a tmux grouped session)
+
+ ┌─────────────────────┐  ┌─────────────────────┐  ┌──────────────────┐
+ │ uart.design         │  │ uart.dv             │  │ uart.debug       │
+ │ (tmux: uart)        │  │ (tmux: uart_dv)     │  │ (standalone)     │
+ ├──────────┬──────────┤  ├──────────┬──────────┤  ├──────────────────┤
+ │ tx       │ rx       │  │ tx       │ rx       │  │                  │
+ │ (Gemini) │ (Codex)  │  │ (Claude) │ (Codex)  │  │ Claude           │
+ └──────────┴──────────┘  └──────────┴──────────┘  └──────────────────┘
+  uart.tmux.design.tx      uart.tmux.dv.tx         uart.terminal.debug
+  uart.tmux.design.rx      uart.tmux.dv.rx
 ```
+
+**Key principle: One tmux window = One Terminal.app window.** Don't create tabs programmatically — AppleScript tab creation is unreliable (keystrokes go to wrong windows).
+
+**Grouped sessions** let different Terminal windows show different tmux windows from the same session. Create a grouped session per window: `tmux new-session -d -t "uart" -s "uart_dv"`, then `tmux select-window -t "uart_dv:dv"`.
+
+---
+
+## Core Operations
+
+### How to send, read, list, and kill
+
+All tmux operations work **without focus** via `tmux send-keys`, `tmux capture-pane`, etc. Terminal.app operations require **AppleScript** and steal focus.
+
+| Operation | tmux pane | Terminal.app window |
+|-----------|-----------|---------------------|
+| **Send text** | `tmux send-keys -t <target> -l "text"` then `Enter` | AppleScript: set clipboard, activate, Cmd+V, Return |
+| **Read output** | `tmux capture-pane -t <target> -p -S -100` | `osascript -e 'tell app "Terminal" to get contents of selected tab of window 1'` |
+| **List all** | `tmux list-panes -a -F '#{session_name} #{window_name} #{pane_title} #{pane_id}'` | `osascript -e 'tell app "Terminal" to get id of every window'` |
+| **Kill** | `tmux kill-pane -t <id>` / `kill-window` / `kill-session` | Close via AppleScript |
+
+**Target syntax**: `session:window.pane_index` or `%N` (direct pane ID). Use `=session:=window` for exact match on session/window names. **Pane titles are NOT native tmux targets** — you must resolve title to `%N` pane ID by listing panes and grepping on `#{pane_title}`. Always resolve to `%N` for reliability.
+
+**Remote**: Wrap any tmux command in `ssh <host> "tmux ..."`. The `@host` suffix in the address tells you when to do this.
+
+### How to set up a new agent
+
+To launch a command at an address:
+1. Create session if needed (`tmux new-session -d -s <session> -n <window>`)
+2. Create window if needed (`tmux new-window -t <session> -n <window>`)
+3. Find pane by title (`list-panes` + grep on `#{pane_title}`), or name the first/split a new one (`select-pane -T <name>`)
+4. Send the command (`send-keys -l "command"` + `Enter`)
+5. Optionally create a grouped session and open a Terminal.app window attached to it via AppleScript
+
+### How to open a Terminal.app window for a tmux session
+
+Use AppleScript to find an existing window by custom title, or create a new one running `tmux attach -t <grouped_session>`. Set the custom title to `session.window` for identification. Always use **separate windows**, never programmatic tabs.
+
+**Stale window detection**: When reusing a window by title, verify it's actually attached to a live tmux session. Check `tmux list-clients` for the window's tty — if the window exists but isn't listed as a client, it's stale (leftover from a dead session). Close stale windows and create fresh ones instead of reusing them.
+
+When using AppleScript clipboard-paste to send text to Terminal.app, **save and restore the clipboard** (`set oldClip to the clipboard` ... `set the clipboard to oldClip`).
+
+---
+
+## Critical: Agent Submit Patterns
+
+Different CLI agents need different key sequences to submit input. **Getting this wrong means the prompt is typed but never sent.**
+
+| Agent | Submit Sequence | Notes |
+|-------|-----------------|-------|
+| **Claude Code** | text, then `Escape`, then **500ms delay**, then `Enter` | Escape exits multi-line edit mode. 500ms is critical for multi-line; 100ms OK for single-line |
+| **Gemini CLI** | text, then `Escape`, then 300ms delay, then `Enter` | Also needs Escape |
+| **Codex CLI** | text, then `Enter` | No Escape needed |
+| **OpenCode** | text, then `Enter` | No Escape needed |
+| **Aider** | text, then `Enter` | No Escape needed |
+| **Shell** | text, then `Enter` | Standard |
+
+### Multi-line text
+
+**Never use `send-keys -l`** for multi-line text — newlines get interpreted as Enter keystrokes. Instead:
+
+1. Write text to a temp file
+2. `tmux load-buffer <tempfile>`
+3. `tmux paste-buffer -t <pane>`
+4. Delete temp file
+5. Then send the agent-specific submit sequence (Escape + Enter for Claude/Gemini, just Enter for others)
+
+---
+
+## Timing & Delays
+
+Delays are not optional. Without them, keys get combined or lost.
+
+| After | Delay | Why |
+|-------|-------|-----|
+| `Escape` (single-line) | 100ms | Prevents `Esc+key` being read as `M-key` (Alt) |
+| `Escape` (multi-line) | **500ms** | Claude needs time to process multi-line buffer exit |
+| Text before `Enter` | 50-100ms | Let tmux buffer flush |
+| After `paste-buffer` | 200ms | Let tmux buffer sync |
+| After `Ctrl+C` | 200ms | Allow interrupt to process |
+
+**tmux.conf**: Set `escape-time` to 10ms (default is 500ms which causes painful Escape delays):
+```
+set -sg escape-time 10
+```
+
+---
+
+## State Detection
+
+Read pane content with `tmux capture-pane` and pattern-match to determine agent state.
+
+**Important**: `capture-pane -p` pads output with trailing empty lines to fill the visible pane height. Always strip empty lines before checking the last line (e.g., `grep -v '^$' | tail -1`). Also, the shell prompt character (like zsh `%`) may not have a trailing space in the capture, even though the cursor appears after a space in the live terminal.
+
+| Agent | Idle | Busy | Waiting for approval |
+|-------|------|------|---------------------|
+| **Claude Code** | Last line is `> ` (with trailing space) | Streaming text, spinner, or status words (Thinking, Reading, Writing, Running) | Permission prompt in output |
+| **Codex CLI** | `$ ` prompt | Output streaming | `[y/n]` or `[Y/n]` |
+| **Gemini CLI** | `> ` prompt | Response streaming | Confirmation prompt |
+| **Aider** | `> ` or `>>>` prompt | Diff output | `y/n` question |
+| **OpenCode** | `> ` prompt | Streaming | Confirmation |
+
+### Verification after send
+
+Always check that the command actually executed:
+1. Capture pane content **before** sending
+2. Send the text + submit keys
+3. Wait briefly, then capture again
+4. Compare — if content hasn't changed, the send failed. Retry.
+
+### Waiting for completion
+
+- **Polling**: Repeatedly capture pane, check if idle pattern appears. Use 3 consecutive idle checks to avoid false positives during brief pauses.
+- **Hash-based change detection**: Compare `md5` of captured content to detect any change.
+- **tmux wait-for**: For shell commands, append `; tmux wait-for -S done` and block on `tmux wait-for done`.
 
 ---
 
 ## Control Matrix
 
-| From → To | Method | Focus Required |
-|-----------|--------|----------------|
-| **tmux → tmux** | `tmux send-keys` | No |
-| **terminal → tmux** | `tmux send-keys` | No |
-| **tmux → terminal** | AppleScript | Yes |
-| **terminal → terminal** | AppleScript | Yes |
+| From → To | Method | Needs Focus? |
+|-----------|--------|:---:|
+| tmux pane → tmux pane | `tmux send-keys` | No |
+| Terminal → tmux pane | `tmux send-keys` | No |
+| tmux pane → Terminal window | AppleScript | Yes |
+| Terminal → Terminal | AppleScript | Yes |
+
+**Prefer tmux-to-tmux** whenever possible — it's focus-free and most reliable.
 
 ---
 
-## Part 1: tmux Control (Focus-Free)
+## Relative Pane Addressing
 
-### Addressing by Name
+Tmux supports relative pane tokens: `{up}`, `{down}`, `{left}`, `{right}`. **Gotcha**: these resolve relative to the **attached client's currently active pane**, not relative to an arbitrary pane you specify. This means they're unreliable when scripting from outside the tmux session. For external scripts, use coordinate-based lookup instead: get pane positions with `list-panes -F '#{pane_id} #{pane_title} (#{pane_left},#{pane_top}) #{pane_width}x#{pane_height}'` and find neighbors by comparing coordinates.
 
-```bash
-# Using named targets
-tmux send-keys -t "uart:dv.tx" -l "hello"    # session:window.pane
-tmux send-keys -t "=uart:=dv" -l "hello"     # Exact match (prevents partial)
+When listing all agents, **filter out grouped sessions** to avoid duplicates — grouped sessions share the same panes as their parent. Check `#{session_group}` and skip sessions whose name differs from their group name.
 
-# List with names
-tmux list-panes -a -F "#{session_name}:#{window_name}.#{pane_title} #{pane_id}"
+---
+
+## Lessons Learned
+
+### Hard rules
+1. **One tmux window = One Terminal window.** Tab creation via AppleScript is broken.
+2. **Use grouped sessions** for independent views of the same tmux session.
+3. **Use `tmux send-keys`** over AppleScript keystrokes for text input — AppleScript keystrokes go to wrong windows.
+4. **AppleScript only for window management** (create, find, focus), not for typing.
+5. **Always use `-l` flag** with `send-keys` for literal text (prevents special char interpretation).
+6. **Always verify after send** — check pane content to confirm the command ran.
+
+### Common pitfalls
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| `M-i` appears instead of Escape then `i` | No delay after Escape | Add sleep (100-500ms depending on context) |
+| Text sent to wrong pane | Ambiguous target name | Use exact `%N` pane ID or `=session:=window` |
+| Multi-line prompt not submitted | Escape delay too short | Use 500ms for Claude multi-line |
+| Multi-line text garbled | Used `send-keys -l` with newlines | Use `load-buffer` + `paste-buffer` |
+| Gemini can't write files | Sandbox restriction | Start Gemini from the target working directory |
+| AppleScript sends to wrong window | Focus race condition | Use tmux instead |
+
+### Recommended tmux.conf
+
 ```
-
-### Core Commands
-
-```bash
-# List all panes
-tmux list-panes -a -F "#{session_name}:#{window_index}.#{pane_index} #{pane_id} #{pane_pid}"
-
-# Send text literally (no key interpretation)
-tmux send-keys -t <target> -l "your text"
-
-# Send keys
-tmux send-keys -t <target> Enter
-tmux send-keys -t <target> Escape
-tmux send-keys -t <target> C-c        # Ctrl+C
-tmux send-keys -t <target> Tab
-
-# Read pane content (last 100 lines)
-tmux capture-pane -t <target> -p -S -100
-```
-
-### Target Syntax
-```bash
-<session>:<window>.<pane>    # "main:0.1"
-%<pane_id>                   # "%5" (direct)
-```
-
-### Critical: Escape + Return for Claude Code
-```bash
-# Claude Code needs Escape THEN Return to submit
-tmux send-keys -t %5 -l "prompt"
-sleep 0.1
-tmux send-keys -t %5 Escape
-sleep 0.1
-tmux send-keys -t %5 Enter
-```
-
-### Delays Are Essential
-| After | Delay | Why |
-|-------|-------|-----|
-| Escape (single-line) | 100ms | Prevent `Esc+key` → `M-key` |
-| **Escape (multi-line)** | **500ms** | Claude needs more time for multi-line buffer |
-| Text before Enter | 50-100ms | Let buffer flush |
-| After paste-buffer | 200ms | Let tmux buffer sync |
-| Ctrl+C | 200ms | Allow interrupt to process |
-
-**tmux.conf optimization:**
-```bash
-set-option -sg escape-time 10  # Reduce from 500ms default
-```
-
-### Sending Text to Agents
-
-**Single-line text**: Use `tmux send-keys -t <pane> -l "text"` then `Enter`
-
-**Multi-line text**: Use `tmux load-buffer` + `paste-buffer` (避免换行符被解释为 Enter)
-
-```bash
-# Multi-line pattern
-tmpfile=$(mktemp)
-echo -n "$text" > "$tmpfile"
-tmux load-buffer "$tmpfile"
-tmux paste-buffer -t "$pane"
-rm "$tmpfile"
-```
-
-### Agent Submit Patterns
-
-| Agent | Submit Sequence | Delay |
-|-------|-----------------|-------|
-| **Claude Code** | text → `Escape` → **500ms** → `Enter` | 500ms before Enter (critical for multi-line) |
-| **Gemini CLI** | text → `Escape` → 300ms → `Enter` | 300ms, also needs Escape |
-| **Codex CLI** | text → `Enter` | No Escape needed |
-| **OpenCode** | text → `Enter` | No Escape needed |
-
-### Verification (发送后检查)
-
-发送命令后，用 `tmux capture-pane` 检查 pane 内容变化：
-- **Working**: 看到 "Thinking", "Creating", "Writing", spinner 等
-- **Idle**: 看到 prompt (`> `, `$ `, `context left`)
-- **Error**: 内容没变化，需要重试
-
-### Wait-for Synchronization
-```bash
-# Wait for command completion
-tmux send-keys -t %5 'command; tmux wait-for -S done' Enter
-tmux wait-for done
+set -sg escape-time 10
+set -g mouse on
+set -g base-index 1
+set -g set-titles on
+set -g set-titles-string "#S.#W"
 ```
 
 ---
 
-## Part 2: AppleScript Control (Requires Focus)
+## AppleScript Key Codes (for Terminal.app control)
 
-Use when controlling Terminal.app/iTerm from outside tmux.
-
-### List Windows
-```bash
-osascript -e 'tell application "Terminal" to get id of every window'
+```
+return=36  escape=53  tab=48  space=49  delete=51
+up=126     down=125   left=123  right=124
 ```
 
-### Send Text (via Clipboard)
-```bash
-osascript <<'EOF'
-set oldClip to the clipboard
-set the clipboard to "your command here"
-tell application "Terminal"
-    activate
-    set frontmost of window 1 to true
-end tell
-delay 0.1
-tell application "System Events"
-    keystroke "v" using command down
-end tell
-delay 0.1
-set the clipboard to oldClip
-EOF
-```
-
-### Send Keys
-```bash
-osascript <<'EOF'
-tell application "Terminal" to activate
-delay 0.1
-tell application "System Events"
-    tell process "Terminal"
-        keystroke return
-    end tell
-end tell
-EOF
-```
-
-### Send Escape + Return (for Claude in Terminal)
-```bash
-osascript <<'EOF'
-tell application "Terminal" to activate
-delay 0.1
-tell application "System Events"
-    tell process "Terminal"
-        key code 53  -- Escape
-        delay 0.1
-        keystroke return
-    end tell
-end tell
-EOF
-```
-
-### Read Content
-```bash
-osascript -e 'tell application "Terminal" to get contents of selected tab of window 1'
-```
-
-### Key Codes Reference
-```
-return=36, escape=53, tab=48, space=49, delete=51
-up=126, down=125, left=123, right=124
-```
-
----
-
-## Part 3: Cross-Control Patterns
-
-### From tmux to Terminal.app (outside tmux)
-```bash
-# AppleScript (switches focus)
-tmux_to_terminal() {
-    osascript -e "
-        set the clipboard to \"$1\"
-        tell application \"Terminal\" to activate
-        delay 0.1
-        tell application \"System Events\" to keystroke \"v\" using command down
-        delay 0.05
-        tell application \"System Events\" to keystroke return
-    "
-}
-```
-
-### From Terminal.app to tmux pane
-```bash
-# tmux send-keys (always works, no focus needed)
-terminal_to_tmux() {
-    tmux send-keys -t "$1" -l "$2"
-    sleep 0.05
-    tmux send-keys -t "$1" Enter
-}
-```
-
----
-
-## Part 5: Monitoring & State Detection
-
-### tmux: Capture Pane Content
-
-```bash
-# Last N lines (most common)
-tmux capture-pane -t %5 -p -S -100
-
-# Full scrollback history
-tmux capture-pane -t %5 -p -S -
-
-# Visible content only (no scrollback)
-tmux capture-pane -t %5 -p
-
-# With escape sequences (for color detection)
-tmux capture-pane -t %5 -p -e -S -50
-
-# Save to file
-tmux capture-pane -t %5 -p -S -100 > /tmp/pane_output.txt
-```
-
-### tmux: Change Detection (MD5 Hash)
-
-```bash
-# Detect when output changes
-watch_pane() {
-    local target=$1
-    local prev_hash=""
-
-    while true; do
-        content=$(tmux capture-pane -t "$target" -p -S -50)
-        curr_hash=$(echo "$content" | md5)
-
-        if [[ "$curr_hash" != "$prev_hash" ]]; then
-            echo "Output changed at $(date)"
-            prev_hash=$curr_hash
-        fi
-        sleep 0.5
-    done
-}
-```
-
-### tmux: Wait for Pattern
-
-```bash
-# Wait until specific pattern appears
-wait_for_pattern() {
-    local target=$1
-    local pattern=$2
-    local timeout=${3:-30}
-    local start=$(date +%s)
-
-    while true; do
-        content=$(tmux capture-pane -t "$target" -p -S -20)
-        if echo "$content" | grep -qE "$pattern"; then
-            return 0
-        fi
-
-        elapsed=$(($(date +%s) - start))
-        if [[ $elapsed -ge $timeout ]]; then
-            return 1  # Timeout
-        fi
-        sleep 0.3
-    done
-}
-
-# Usage: wait for prompt
-wait_for_pattern %5 '(\$|>|#) $' 60
-```
-
-### tmux: Agent State Detection
-
-```bash
-detect_agent_state() {
-    local target=$1
-    local content=$(tmux capture-pane -t "$target" -p -S -10)
-    local last_line=$(echo "$content" | tail -1)
-
-    # Claude Code states
-    if echo "$last_line" | grep -q '^>'; then
-        echo "idle"
-    elif echo "$content" | grep -q '!'; then
-        echo "pending_approval"
-    elif echo "$content" | grep -qE '(Thinking|Reading|Writing|Running)'; then
-        echo "busy"
-    else
-        echo "unknown"
-    fi
-}
-```
-
-### Agent State Patterns
-
-| Agent | Idle Pattern | Busy Pattern | Pending Approval |
-|-------|--------------|--------------|------------------|
-| **Claude Code** | `^> $` at end | Spinner/streaming | `!` in status |
-| **Codex CLI** | `\$ $` prompt | Output streaming | `[y/n]` or `[Y/n]` |
-| **Gemini CLI** | `> $` prompt | Response text | Confirmation prompt |
-| **Aider** | `> $` or `>>>` | Diff output | `y/n` question |
-| **OpenCode** | `> $` prompt | Streaming | Confirmation |
-
-### tmux: Polling Loop with Callback
-
-```bash
-monitor_pane() {
-    local target=$1
-    local callback=$2
-    local interval=${3:-1}
-
-    while true; do
-        content=$(tmux capture-pane -t "$target" -p -S -30)
-        $callback "$content"
-        sleep "$interval"
-    done
-}
-
-# Example callback
-on_content() {
-    local content=$1
-    if echo "$content" | grep -q "error"; then
-        echo "Error detected!"
-    fi
-}
-
-# Usage
-monitor_pane %5 on_content 0.5
-```
-
-### AppleScript: Read Terminal Content
-
-```bash
-# Read Terminal.app content
-osascript -e 'tell application "Terminal" to get contents of selected tab of window 1'
-
-# Read specific window by ID
-osascript -e 'tell application "Terminal" to get contents of selected tab of window id 1234'
-
-# Get history (may be limited)
-osascript -e 'tell application "Terminal" to get history of selected tab of window 1'
-```
-
-### Monitor Script
-
-```bash
-#!/bin/bash
-# Universal pane monitor
-
-monitor() {
-    local target=$1
-    local mode=${2:-tmux}  # tmux, applescript
-
-    case $mode in
-        tmux)
-            tmux capture-pane -t "$target" -p -S -50
-            ;;
-        applescript)
-            osascript -e "tell application \"Terminal\" to get contents of selected tab of window id $target"
-            ;;
-    esac
-}
-
-# Continuous monitoring with change detection
-continuous_monitor() {
-    local target=$1
-    local mode=$2
-    local prev=""
-
-    while true; do
-        curr=$(monitor "$target" "$mode")
-        if [[ "$curr" != "$prev" ]]; then
-            clear
-            echo "=== $(date) ==="
-            echo "$curr" | tail -20
-            prev=$curr
-        fi
-        sleep 0.5
-    done
-}
-```
-
-### Idle Detection with Timeout
-
-```bash
-wait_for_idle() {
-    local target=$1
-    local timeout=${2:-120}
-    local check_interval=${3:-1}
-    local stable_count=0
-    local stable_needed=3  # Need 3 consecutive idle checks
-    local start=$(date +%s)
-
-    while true; do
-        state=$(detect_agent_state "$target")
-
-        if [[ "$state" == "idle" ]]; then
-            ((stable_count++))
-            if [[ $stable_count -ge $stable_needed ]]; then
-                return 0
-            fi
-        else
-            stable_count=0
-        fi
-
-        elapsed=$(($(date +%s) - start))
-        if [[ $elapsed -ge $timeout ]]; then
-            return 1
-        fi
-
-        sleep "$check_interval"
-    done
-}
-```
-
----
-
-## Lessons Learned (2026-02)
-
-### AppleScript Limitations
-
-| Issue | Cause | Solution |
-|-------|-------|----------|
-| Tab creation unreliable | `keystroke "t"` goes to wrong window | Use separate Terminal windows |
-| keystroke sends to wrong app | Terminal not properly focused | Use `tmux send-keys` instead |
-| Custom title overwritten | Apps (Claude) change terminal title | Accept or disable in Terminal prefs |
-
-### Best Practices
-
-1. **One tmux window = One Terminal window** - Don't try to create tabs programmatically
-2. **Use grouped sessions** - For independent window views (`uart` + `uart_dv`)
-3. **Use `tmux send-keys`** - More reliable than AppleScript keystroke for text input
-4. **AppleScript only for window management** - Creating/finding windows, not sending keystrokes
-5. **Delays after Escape** - 100ms for single-line, **500ms for multi-line** (critical for Claude)
-6. **Use `tmux load-buffer` + `paste-buffer`** - For multi-line text input
-7. **Always verify after send** - Check pane status to confirm command executed
-8. **Gemini sandbox** - Start Gemini from target directory to avoid path restrictions
-
-### Multi-line Text Workflow
-
-发送多行文本到 agent 的步骤：
-
-1. **发送前检查** - 用 `tmux capture-pane` 记录当前内容
-2. **使用 buffer 发送** - `load-buffer` + `paste-buffer` 避免换行问题
-3. **按 agent 类型提交**:
-   - Claude: `Escape` → 等待 **500ms** → `Enter`
-   - Gemini: `Escape` → 等待 300ms → `Enter`
-   - Codex/其他: 直接 `Enter`
-4. **发送后验证** - 再次 `capture-pane`，对比内容是否变化
-
-如果内容没变化，说明命令没执行成功，需要重试。
-
-### tmux.conf Minimal Setup
-
-```bash
-# ~/.tmux.conf
-set -sg escape-time 10      # Reduce escape delay (default 500ms)
-set -g mouse on             # Enable mouse for pane selection
-set -g base-index 1         # Start window numbering at 1
-set -g set-titles on        # Allow title setting
-set -g set-titles-string "#S.#W"  # Format: session.window
-```
-
-## Common Pitfalls
-
-| Issue | Cause | Fix |
-|-------|-------|-----|
-| `M-i` instead of Esc then i | No delay | Add `sleep 0.1` after Escape |
-| Wrong pane | Ambiguous target | Use exact `%N` pane ID |
-| Text truncated | Special chars | Use `-l` flag |
-| Focus stolen | Using AppleScript | Use tmux panes instead |
-| Command not run | Missing Enter | Add `Enter` after text |
-| Keystrokes to wrong window | AppleScript keystroke | Use `tmux send-keys` for tmux panes |
-| Tab creation fails | AppleScript limitation | Use separate windows |
-| **Multi-line not submitted** | Escape delay too short | Use **500ms** delay before Enter for Claude |
-| Multi-line text garbled | Using send-keys -l | Use `load-buffer` + `paste-buffer` instead |
-| Gemini can't write files | Sandbox restriction | Start Gemini from target directory |
-| Command not executed | No verification | Always check pane after send |
-
----
-
-## Quick Reference Card
-
-```bash
-# === SEND ===
-tmux send-keys -t %5 -l "text"              # Send text literally
-tmux send-keys -t %5 Enter Escape C-c       # Send keys
-osascript -e 'tell app "Terminal" to activate'  # Focus Terminal
-
-# === READ / MONITOR ===
-tmux capture-pane -t %5 -p -S -100          # Last 100 lines
-tmux capture-pane -t %5 -p -S -             # Full history
-tmux capture-pane -t %5 -p                  # Visible only
-osascript -e 'tell app "Terminal" to get contents of selected tab of window 1'
-
-# === LIST ===
-tmux list-panes -a -F "#{pane_id} #{pane_title}"
-osascript -e 'tell app "Terminal" to get id of every window'
-
-# === CHANGE DETECTION ===
-content=$(tmux capture-pane -t %5 -p -S -50)
-hash=$(echo "$content" | md5)               # Compare hashes
-
-# === STATE DETECTION ===
-# Idle: ends with '> $' or '$ $'
-# Busy: contains spinner or streaming output
-# Approval: contains '!' or '[y/n]'
-
-# === KEY CODES ===
-# tmux: C-=Ctrl, M-=Alt, Enter, Escape, Tab, Space, BSpace
-# AppleScript: return=36, escape=53, tab=48, space=49, delete=51
-```
-
----
-
-## Sources
-
-- [tmux send-keys patterns](https://minimul.com/increased-developer-productivity-with-tmux-part-5.html)
-- [Scripting tmux](https://www.arp242.net/tmux.html)
-- [Control sequences gist](https://gist.github.com/stephancasas/1c82b66be1ea664c2a8f18019a436938)
-- [Agent Conductor](https://github.com/gaurav-yadav/agent-conductor)
-- [Claude Squad](https://github.com/smtg-ai/claude-squad)
-- [TmuxCC](https://github.com/nyanko3141592/tmuxcc)
+Use `key code N` in AppleScript for special keys, `keystroke "v" using command down` for shortcuts.
