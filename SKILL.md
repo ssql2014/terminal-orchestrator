@@ -229,11 +229,11 @@ Use `key code N` in AppleScript for special keys, `keystroke "v" using command d
 
 ## Usage Examples
 
-These are example prompts you can use with Claude to orchestrate agents via tmux and Terminal.app.
+Example prompts you can use with Claude to orchestrate agents via tmux and Terminal.app.
 
 ### Example 1: Starting an agent
 ```
-在 myproject.tmux:design.left 中启动 Claude in bypass mode
+Start Claude in bypass mode at myproject.tmux:design.left
 ```
 This will:
 - Create tmux session `myproject` with window `design`
@@ -243,19 +243,19 @@ This will:
 
 ### Example 2: Starting multiple agents
 ```
-在 webapp.tmux:backend.left 启动 Claude，在 webapp.tmux:backend.right 启动 Gemini
+Start Claude at webapp.tmux:backend.left and Gemini at webapp.tmux:backend.right
 ```
 Creates two agents in the same tmux window (split panes) with one Terminal window showing both.
 
 ### Example 3: Sending a task to an agent
 ```
-向 myproject.tmux:design.left 发送："Create a responsive navigation bar component"
+Send to myproject.tmux:design.left: "Create a responsive navigation bar component"
 ```
 Sends the prompt to the Claude agent, handling proper escaping and timing for submission.
 
 ### Example 4: Sending multi-line prompts
 ```
-向 webapp.tmux:backend.right 发送：
+Send to webapp.tmux:backend.right:
 """
 Review the API endpoints in api/routes.js and:
 1. Add input validation
@@ -267,39 +267,39 @@ Uses tmux load-buffer/paste-buffer to safely send multi-line text.
 
 ### Example 5: Checking agent status
 ```
-检查 myproject.tmux:design 中所有 pane 的状态
+Check status of all panes in myproject.tmux:design
 ```
 Lists all panes in the window and reports whether each agent is idle, busy, or awaiting approval.
 
 ### Example 6: Reading agent output
 ```
-读取 webapp.tmux:backend.left 的最近输出
+Read recent output from webapp.tmux:backend.left
 ```
 Captures and displays the recent terminal output from the specified pane.
 
 ### Example 7: Waiting for completion
 ```
-等待 myproject.tmux:design.left 完成任务
+Wait for myproject.tmux:design.left to complete the task
 ```
 Polls the pane until the agent returns to idle state (shows `> ` prompt).
 
 ### Example 8: Coordinating multiple agents
 ```
-在 webapp.tmux:frontend.left 启动 Claude 处理 UI，
-在 webapp.tmux:backend.right 启动 Gemini 处理 API，
-然后向 frontend.left 发送 "Create login page"，
-向 backend.right 发送 "Create /auth/login endpoint"
+Start Claude at webapp.tmux:frontend.left for UI work,
+start Gemini at webapp.tmux:backend.right for API work,
+then send "Create login page" to frontend.left,
+and send "Create /auth/login endpoint" to backend.right
 ```
 Orchestrates multiple agents working on related tasks in parallel.
 
 ### Example 9: Remote agent control
 ```
-在 build-server 的 cicd.tmux:pipeline.runner 中运行 "npm run build"
+Run "npm run build" at cicd.tmux:pipeline.runner@build-server
 ```
 Executes commands on a remote tmux session via SSH. Address: `cicd.tmux:pipeline.runner@build-server`
 
 ### Example 10: Cleanup
 ```
-kill myproject session 和对应的 Terminal 窗口
+Kill myproject session and its Terminal windows
 ```
 Terminates the tmux session and closes all associated Terminal.app windows (one-to-one cleanup).
