@@ -11,7 +11,7 @@ Control AI agents (Claude, Gemini, Codex, etc.) running in tmux panes and Termin
 
 ## Addressing Convention
 
-Every agent has a dot-separated address: `session.type.window[.pane][@host]`
+Every agent has an address: `session.type:window[.pane][@host]`
 
 | Part | Meaning | Example |
 |------|---------|---------|
@@ -22,9 +22,9 @@ Every agent has a dot-separated address: `session.type.window[.pane][@host]`
 | **@host** | Remote machine (optional) | `@build-server`, `@10.0.1.50` |
 
 Examples:
-- `myproject.tmux.design.left` — local tmux pane
-- `myproject.tmux.dev.left@build-server` — remote tmux pane (via SSH)
-- `myproject.terminal.debug` — standalone Terminal.app window
+- `myproject.tmux:design.left` — local tmux pane
+- `myproject.tmux:dev.left@build-server` — remote tmux pane (via SSH)
+- `myproject.terminal:debug` — standalone Terminal.app window
 
 Parse by splitting on `.` for the address parts and `@` for the host. Like email: `agent@location`.
 
@@ -42,13 +42,13 @@ Parse by splitting on `.` for the address parts and `@` for the host. Like email
  │ left     │ right    │  │ left     │ right    │  │                  │
  │ (Gemini) │ (Codex)  │  │ (Claude) │ (Codex)  │  │ Claude           │
  └──────────┴──────────┘  └──────────┴──────────┘  └──────────────────┘
-  myproject.tmux.design.left  myproject.tmux.dev.left    myproject.terminal.debug
-  myproject.tmux.design.right myproject.tmux.dev.right
+  myproject.tmux:design.left  myproject.tmux:dev.left    myproject.terminal:debug
+  myproject.tmux:design.right myproject.tmux:dev.right
 ```
 
 **Key principle: One tmux window = One Terminal.app window.** Don't create tabs programmatically — AppleScript tab creation is unreliable (keystrokes go to wrong windows).
 
-**Grouped sessions** let different Terminal windows show different tmux windows from the same session. Create a grouped session per window: `tmux new-session -d -t "uart" -s "uart_dv"`, then `tmux select-window -t "uart_dv:dv"`.
+**Grouped sessions** let different Terminal windows show different tmux windows from the same session. Create a grouped session per window: `tmux new-session -d -t "myproject" -s "myproject_dev"`, then `tmux select-window -t "myproject_dev:dev"`.
 
 ---
 
@@ -80,7 +80,7 @@ To launch a command at an address:
 
 ### How to open a Terminal.app window for a tmux session
 
-Use AppleScript to find an existing window by custom title, or create a new one running `tmux attach -t <grouped_session>`. Set the custom title to `session.window` for identification. Always use **separate windows**, never programmatic tabs.
+Use AppleScript to find an existing window by custom title, or create a new one running `tmux attach -t <grouped_session>`. Set the custom title to `session.type:window` for identification. Always use **separate windows**, never programmatic tabs.
 
 **Stale window detection**: When reusing a window by title, verify it's actually attached to a live tmux session. Check `tmux list-clients` for the window's tty — if the window exists but isn't listed as a client, it's stale (leftover from a dead session). Close stale windows and create fresh ones instead of reusing them.
 
