@@ -224,3 +224,208 @@ up=126     down=125   left=123  right=124
 ```
 
 Use `key code N` in AppleScript for special keys, `keystroke "v" using command down` for shortcuts.
+
+---
+
+## Usage Examples
+
+### Example 1: Launch Claude in a new tmux pane with Terminal window
+
+```bash
+SESSION="myproject"
+WINDOW="design"
+PANE="left"
+
+# 1. Create session and window if needed
+tmux has-session -t "$SESSION" 2>/dev/null || tmux new-session -d -s "$SESSION" -n "$WINDOW"
+tmux list-windows -t "$SESSION" | grep -q "$WINDOW" || tmux new-window -t "$SESSION" -n "$WINDOW"
+
+# 2. Find or create pane
+PANE_ID=$(tmux list-panes -t "$SESSION:$WINDOW" -F '#{pane_id} #{pane_title}' | grep "$PANE$" | awk '{print $1}')
+if [ -z "$PANE_ID" ]; then
+  tmux select-window -t "$SESSION:$WINDOW"
+  tmux split-window -h -t "$SESSION:$WINDOW"
+  PANE_ID=$(tmux display-message -p -t "$SESSION:$WINDOW" '#{pane_id}')
+  tmux select-pane -t "$PANE_ID" -T "$PANE"
+fi
+
+# 3. Open Terminal window and attach
+osascript <<EOF
+tell application "Terminal"
+  do script "tmux attach -t $SESSION:$WINDOW || tmux new-session -s $SESSION -n $WINDOW"
+  set custom title of front window to "$SESSION.tmux:$WINDOW"
+  activate
+end tell
+EOF
+
+# 4. Start Claude in bypass mode
+sleep 1
+tmux send-keys -t "$PANE_ID" -l "claude --permission-mode bypassPermissions"
+sleep 0.1
+tmux send-keys -t "$PANE_ID" Enter
+
+# 5. Verify startup
+sleep 3
+tmux capture-pane -t "$PANE_ID" -p -S -20 | tail -10
+```
+
+**Address:** `myproject.tmux:design.left`
+
+### Example 2: Send a prompt to Claude and wait for completion
+
+```bash
+PANE_ID="%18"  # Use actual pane ID from list-panes
+PROMPT="Create a hello world script in Python"
+
+# 1. Capture state before sending
+BEFORE=$(tmux capture-pane -t "$PANE_ID" -p | md5)
+
+# 2. Send the prompt (multi-line safe)
+echo "$PROMPT" > /tmp/prompt.txt
+tmux load-buffer /tmp/prompt.txt
+tmux paste-buffer -t "$PANE_ID"
+rm /tmp/prompt.txt
+
+# 3. Submit with Claude-specific timing
+sleep 0.1
+tmux send-keys -t "$PANE_ID" Escape
+sleep 0.5  # Critical delay for multi-line
+tmux send-keys -t "$PANE_ID" Enter
+
+# 4. Wait for Claude to become idle
+for i in {1..60}; do
+  sleep 2
+  CONTENT=$(tmux capture-pane -t "$PANE_ID" -p -S -5 | grep -v '^$')
+  if echo "$CONTENT" | tail -1 | grep -q '^> $'; then
+    echo "Claude is idle"
+    break
+  fi
+  echo "Waiting... ($i)"
+done
+
+# 5. Capture the response
+tmux capture-pane -t "$PANE_ID" -p -S -100
+```
+
+### Example 3: Kill session and Terminal window (one-to-one cleanup)
+
+```bash
+SESSION="myproject"
+
+# 1. Close all Terminal windows for this session
+osascript <<EOF
+tell application "Terminal"
+  set windowList to every window
+  repeat with aWindow in windowList
+    try
+      set windowTitle to custom title of aWindow
+      if windowTitle contains "$SESSION.tmux:" then
+        close aWindow
+      end if
+    end try
+  end repeat
+end tell
+EOF
+
+# 2. Kill tmux session and grouped sessions
+tmux list-sessions -F '#{session_name} #{session_group}' 2>/dev/null | while read name group; do
+  if [[ "$name" == "$SESSION" ]] || [[ "$group" == "$SESSION" ]]; then
+    tmux kill-session -t "$name"
+    echo "Killed: $name"
+  fi
+done
+```
+
+### Example 4: Monitor agent state across multiple panes
+
+```bash
+SESSION="myproject"
+WINDOW="design"
+
+# List all panes and their states
+tmux list-panes -t "$SESSION:$WINDOW" -F '#{pane_id} #{pane_title}' | while read pane_id title; do
+  echo "=== Pane: $title ($pane_id) ==="
+
+  # Capture last line (strip empty lines first)
+  LAST_LINE=$(tmux capture-pane -t "$pane_id" -p -S -5 | grep -v '^$' | tail -1)
+
+  # Detect state
+  if [[ "$LAST_LINE" =~ ^'> '$ ]]; then
+    echo "Status: IDLE"
+  elif [[ "$LAST_LINE" =~ (Thinking|Reading|Writing|Running) ]]; then
+    echo "Status: BUSY"
+  elif [[ "$LAST_LINE" =~ \[y/n\] ]]; then
+    echo "Status: AWAITING APPROVAL"
+  else
+    echo "Status: UNKNOWN"
+    echo "Last line: $LAST_LINE"
+  fi
+  echo
+done
+```
+
+### Example 5: Coordinate multiple agents on the same task
+
+```bash
+# Setup: 3 agents working on a web app
+# - design.left: Claude (UI/UX)
+# - design.right: Gemini (backend API)
+# - test.main: Codex (testing)
+
+SESSION="webapp"
+
+# Create all panes
+for window_pane in "design.left" "design.right" "test.main"; do
+  WINDOW="${window_pane%.*}"
+  PANE="${window_pane#*.}"
+
+  # Create window if needed
+  tmux list-windows -t "$SESSION" | grep -q "$WINDOW" || \
+    tmux new-window -t "$SESSION" -n "$WINDOW"
+
+  # Create and name pane
+  # ... (similar to Example 1)
+done
+
+# Open Terminal windows (one per tmux window)
+for window in "design" "test"; do
+  osascript <<EOF
+tell application "Terminal"
+  do script "tmux attach -t $SESSION:$window"
+  set custom title of front window to "$SESSION.tmux:$window"
+end tell
+EOF
+done
+
+# Send coordinated tasks
+tmux send-keys -t "$SESSION:design.0" -l "Create a responsive navbar component"
+tmux send-keys -t "$SESSION:design.0" Escape
+sleep 0.5
+tmux send-keys -t "$SESSION:design.0" Enter
+
+tmux send-keys -t "$SESSION:design.1" -l "Create REST API for user authentication"
+tmux send-keys -t "$SESSION:design.1" Escape
+sleep 0.3
+tmux send-keys -t "$SESSION:design.1" Enter
+
+tmux send-keys -t "$SESSION:test.0" -l "Write integration tests for the auth flow"
+tmux send-keys -t "$SESSION:test.0" Enter
+```
+
+### Example 6: Remote agent control
+
+```bash
+# Control an agent running on a remote build server
+REMOTE="build-server"
+SESSION="cicd"
+WINDOW="pipeline"
+PANE="runner"
+
+# Send command to remote tmux pane
+ssh "$REMOTE" "tmux send-keys -t $SESSION:$WINDOW.0 -l 'npm run build' && tmux send-keys -t $SESSION:$WINDOW.0 Enter"
+
+# Monitor remote pane output
+ssh "$REMOTE" "tmux capture-pane -t $SESSION:$WINDOW.0 -p -S -50"
+
+# Address format: cicd.tmux:pipeline.runner@build-server
+```
