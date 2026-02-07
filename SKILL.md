@@ -15,16 +15,16 @@ Every agent has a dot-separated address: `session.type.window[.pane][@host]`
 
 | Part | Meaning | Example |
 |------|---------|---------|
-| **session** | Project/task group | `uart`, `webapp` |
+| **session** | Project/task group | `myproject`, `webapp` |
 | **type** | Runtime: `tmux` or `terminal` | `tmux` |
-| **window** | Functional area | `design`, `dv`, `debug` |
-| **pane** | Specific agent (tmux only) | `tx`, `rx`, `main` |
-| **@host** | Remote machine (optional) | `@ist-mac-s`, `@192.168.1.5` |
+| **window** | Functional area | `design`, `dev`, `test`, `debug` |
+| **pane** | Specific agent (tmux only) | `left`, `right`, `main` |
+| **@host** | Remote machine (optional) | `@build-server`, `@10.0.1.50` |
 
 Examples:
-- `uart.tmux.design.tx` — local tmux pane
-- `uart.tmux.design.tx@ist-mac-s` — remote tmux pane (via SSH)
-- `uart.terminal.debug` — standalone Terminal.app window
+- `myproject.tmux.design.left` — local tmux pane
+- `myproject.tmux.dev.left@build-server` — remote tmux pane (via SSH)
+- `myproject.terminal.debug` — standalone Terminal.app window
 
 Parse by splitting on `.` for the address parts and `@` for the host. Like email: `agent@location`.
 
@@ -36,14 +36,14 @@ Parse by splitting on `.` for the address parts and `@` for the host. Like email
  Terminal Windows (each attached to a tmux grouped session)
 
  ┌─────────────────────┐  ┌─────────────────────┐  ┌──────────────────┐
- │ uart.design         │  │ uart.dv             │  │ uart.debug       │
- │ (tmux: uart)        │  │ (tmux: uart_dv)     │  │ (standalone)     │
+ │ myproject.design    │  │ myproject.dev       │  │ myproject.debug  │
+ │ (tmux: myproject)   │  │ (tmux: myproject_d) │  │ (standalone)     │
  ├──────────┬──────────┤  ├──────────┬──────────┤  ├──────────────────┤
- │ tx       │ rx       │  │ tx       │ rx       │  │                  │
+ │ left     │ right    │  │ left     │ right    │  │                  │
  │ (Gemini) │ (Codex)  │  │ (Claude) │ (Codex)  │  │ Claude           │
  └──────────┴──────────┘  └──────────┴──────────┘  └──────────────────┘
-  uart.tmux.design.tx      uart.tmux.dv.tx         uart.terminal.debug
-  uart.tmux.design.rx      uart.tmux.dv.rx
+  myproject.tmux.design.left  myproject.tmux.dev.left    myproject.terminal.debug
+  myproject.tmux.design.right myproject.tmux.dev.right
 ```
 
 **Key principle: One tmux window = One Terminal.app window.** Don't create tabs programmatically — AppleScript tab creation is unreliable (keystrokes go to wrong windows).
