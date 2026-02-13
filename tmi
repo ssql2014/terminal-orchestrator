@@ -1,0 +1,381 @@
+#!/usr/bin/env bash
+# tmi — tmux interaction toolkit for AI agents
+# Unified interface: send input, read output, detect changes & app state
+
+set -uo pipefail
+
+TMI_DIR="/tmp/tmi"
+POLL_INTERVAL=0.3
+DEFAULT_TIMEOUT=30
+
+# --- Utilities ---
+
+die() { echo "tmi: $*" >&2; exit 2; }
+
+md5_hash() {
+    if command -v md5 &>/dev/null; then
+        md5 -q
+    else
+        md5sum | cut -d' ' -f1
+    fi
+}
+
+pane_dir() {
+    local safe="${1//[^a-zA-Z0-9_-]/_}"
+    mkdir -p "$TMI_DIR/$safe"
+    echo "$TMI_DIR/$safe"
+}
+
+# Capture raw pane content (includes trailing empty lines)
+capture_raw() {
+    tmux capture-pane -t "$1" -p 2>/dev/null || die "pane '$1' not found"
+}
+
+# Capture with trailing blank lines stripped
+capture_trimmed() {
+    capture_raw "$1" | awk '{
+        sub(/[[:space:]]+$/, "")
+        lines[NR] = $0
+        if ($0 != "") last = NR
+    } END {
+        for (i = 1; i <= last; i++) print lines[i]
+    }'
+}
+
+# Get cursor position from tmux
+get_cursor() {
+    tmux display -t "$1" -p '#{cursor_x} #{cursor_y}' 2>/dev/null
+}
+
+# --- send ---
+
+cmd_send() {
+    local pane="$1"; shift
+    local typing=0  # chars per second, 0 = instant
+
+    # Parse options before text
+    while [[ "${1:-}" == --* ]]; do
+        case "$1" in
+            --type)   typing="${2:-8}"; shift 2 ;;
+            *) die "send: unknown option '$1'" ;;
+        esac
+    done
+
+    local text="$*"
+    [[ -z "$text" ]] && die "send: missing text"
+
+    local i=0 len=${#text} buf=""
+    local type_delay=0
+    (( typing > 0 )) && type_delay=$(awk "BEGIN{printf \"%.3f\", 1/$typing}")
+
+    _flush() {
+        if [[ -n "$buf" ]]; then
+            if (( typing > 0 )); then
+                # Character-by-character with delay
+                local j
+                for (( j=0; j<${#buf}; j++ )); do
+                    tmux send-keys -t "$pane" -l "${buf:$j:1}"
+                    sleep "$type_delay"
+                done
+            else
+                tmux send-keys -t "$pane" -l "$buf"
+                sleep 0.02
+            fi
+            buf=""
+        fi
+    }
+
+    while (( i < len )); do
+        local ch="${text:$i:1}"
+
+        if [[ "$ch" == '\' ]] && (( i + 1 < len )); then
+            local nxt="${text:$((i+1)):1}"
+            case "$nxt" in
+                e)  _flush; tmux send-keys -t "$pane" Escape; sleep 0.15
+                    (( i += 2 )); continue ;;
+                n)  _flush; tmux send-keys -t "$pane" Enter; sleep 0.05
+                    (( i += 2 )); continue ;;
+                t)  _flush; tmux send-keys -t "$pane" Tab; sleep 0.02
+                    (( i += 2 )); continue ;;
+                c)  # \cX = Ctrl+X
+                    if (( i + 2 < len )); then
+                        _flush
+                        tmux send-keys -t "$pane" "C-${text:$((i+2)):1}"
+                        sleep 0.05
+                        (( i += 3 )); continue
+                    fi ;;
+                x)  # \xHH = hex byte
+                    if (( i + 3 < len )); then
+                        _flush
+                        local hex="${text:$((i+2)):2}"
+                        tmux send-keys -t "$pane" -l "$(printf "\\x$hex")"
+                        (( typing > 0 )) && sleep "$type_delay" || sleep 0.02
+                        (( i += 4 )); continue
+                    fi ;;
+                \\) buf+='\\'; (( i += 2 )); continue ;;
+            esac
+        fi
+
+        buf+="$ch"
+        (( i++ )) || true
+    done
+    _flush
+}
+
+# --- read ---
+
+cmd_read() {
+    local pane="$1"; shift
+    local show_cursor=false raw=false last=0
+
+    while (( $# > 0 )); do
+        case "$1" in
+            --cursor) show_cursor=true; shift ;;
+            --raw)    raw=true; shift ;;
+            --last)   last="$2"; shift 2 ;;
+            *) die "read: unknown option '$1'" ;;
+        esac
+    done
+
+    local content
+    if $raw; then
+        content=$(capture_raw "$pane")
+    else
+        content=$(capture_trimmed "$pane")
+    fi
+
+    if (( last > 0 )); then
+        content=$(echo "$content" | tail -n "$last")
+    fi
+
+    echo "$content"
+
+    if $show_cursor; then
+        local pos
+        pos=$(get_cursor "$pane")
+        local cx="${pos%% *}" cy="${pos##* }"
+        echo "cursor={row:$((cy+1)),col:$((cx+1))}"
+
+        # Also try to extract vim file position from ruler (e.g. "3,27  All")
+        local status
+        status=$(capture_raw "$pane" | tail -3)
+        local ruler
+        if ruler=$(echo "$status" | grep -oE '[0-9]+,[0-9]+(-[0-9]+)?' | tail -1); then
+            echo "vim_pos={line:${ruler%%,*},col:${ruler#*,}}"
+        fi
+    fi
+}
+
+# --- activity ---
+
+cmd_activity() {
+    local pane="$1"
+    local dir
+    dir=$(pane_dir "$pane")
+
+    local cur_hash
+    cur_hash=$(capture_raw "$pane" | md5_hash)
+
+    local prev=""
+    [[ -f "$dir/hash" ]] && prev=$(<"$dir/hash")
+
+    echo "$cur_hash" > "$dir/hash"
+
+    if [[ "$cur_hash" != "$prev" ]]; then
+        echo "changed"
+        return 0
+    else
+        echo "unchanged"
+        return 1
+    fi
+}
+
+# --- wait ---
+
+cmd_wait() {
+    local pane="$1"; shift
+    local timeout=$DEFAULT_TIMEOUT contains="" line="" idle=false regex=false
+
+    while (( $# > 0 )); do
+        case "$1" in
+            --timeout)  timeout="$2"; shift 2 ;;
+            --contains) contains="$2"; shift 2 ;;
+            --regex)    regex=true; shift ;;
+            --line)     line="$2"; shift 2 ;;
+            --idle)     idle=true; shift ;;
+            *) die "wait: unknown option '$1'" ;;
+        esac
+    done
+
+    local start
+    start=$(date +%s)
+    local elapsed=0
+
+    if $idle; then
+        local prev_hash="" unchanged=0
+        while true; do
+            elapsed=$(( $(date +%s) - start ))
+            (( elapsed >= timeout )) && { echo "timeout"; return 1; }
+
+            local cur
+            cur=$(capture_raw "$pane" | md5_hash)
+            if [[ "$cur" == "$prev_hash" ]]; then
+                (( ++unchanged ))
+                (( unchanged >= 3 )) && { echo "idle"; return 0; }
+            else
+                unchanged=0
+            fi
+            prev_hash="$cur"
+            sleep "$POLL_INTERVAL"
+        done
+    fi
+
+    [[ -z "$contains" ]] && die "wait: need --contains or --idle"
+
+    while true; do
+        elapsed=$(( $(date +%s) - start ))
+        (( elapsed >= timeout )) && { echo "timeout"; return 1; }
+
+        local content check_text
+        content=$(capture_trimmed "$pane")
+
+        if [[ -n "$line" ]]; then
+            if [[ "$line" == "-1" ]]; then
+                check_text=$(echo "$content" | tail -1)
+            else
+                check_text=$(echo "$content" | sed -n "${line}p")
+            fi
+        else
+            check_text="$content"
+        fi
+
+        if $regex; then
+            echo "$check_text" | grep -qE "$contains" && { echo "matched"; return 0; }
+        else
+            echo "$check_text" | grep -qF "$contains" && { echo "matched"; return 0; }
+        fi
+
+        sleep "$POLL_INTERVAL"
+    done
+}
+
+# --- state ---
+
+cmd_state() {
+    local pane="$1"
+    local content
+    content=$(capture_trimmed "$pane")
+    local last5
+    last5=$(echo "$content" | tail -5)
+
+    # Get screen cursor
+    local pos cx cy
+    pos=$(get_cursor "$pane")
+    cx="${pos%% *}" cy="${pos##* }"
+
+    # --- Vim ---
+    if echo "$last5" | grep -qE '[0-9]+,[0-9]+(-[0-9]+)?[[:space:]]+(All|Top|Bot|[0-9]+%)'; then
+        local mode="normal"
+        if echo "$last5" | grep -qE -- '-- INSERT --'; then
+            mode="insert"
+        elif echo "$last5" | grep -qE -- '-- VISUAL'; then
+            mode="visual"
+        elif echo "$last5" | grep -qE -- '-- REPLACE --'; then
+            mode="replace"
+        fi
+        # Check command line mode (last line starts with :)
+        local lastline
+        lastline=$(echo "$content" | tail -1)
+        if [[ "$lastline" == :* ]]; then
+            mode="command"
+        fi
+        local ruler
+        ruler=$(echo "$last5" | grep -oE '[0-9]+,[0-9]+(-[0-9]+)?' | tail -1)
+        local frow="${ruler%%,*}" fcol="${ruler#*,}"
+        fcol="${fcol%%-*}"
+        echo "app=vim mode=$mode cursor=$((cy+1)),$((cx+1)) file_pos=$frow,$fcol"
+        return 0
+    fi
+
+    # --- Claude Code ---
+    if echo "$content" | head -5 | grep -qiE 'claude'; then
+        local busy="false"
+        if echo "$last5" | grep -qE '(⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏|Thinking|working)'; then
+            busy="true"
+        fi
+        echo "app=claude busy=$busy cursor=$((cy+1)),$((cx+1))"
+        return 0
+    fi
+
+    # --- Shell (idle = prompt on last line) ---
+    local lastline
+    lastline=$(echo "$content" | tail -1)
+    if echo "$lastline" | grep -qE '(\$|#|❯|➜|>|%)[[:space:]]*$'; then
+        echo "app=shell idle=true cursor=$((cy+1)),$((cx+1))"
+        return 0
+    fi
+
+    # Shell running a command (prompt visible earlier)
+    if echo "$content" | grep -qE '(\$|#|❯|➜|>|%)[[:space:]]'; then
+        echo "app=shell idle=false cursor=$((cy+1)),$((cx+1))"
+        return 0
+    fi
+
+    echo "app=unknown cursor=$((cy+1)),$((cx+1))"
+}
+
+# --- Help ---
+
+usage() {
+    cat <<'USAGE'
+tmi — tmux interaction toolkit
+
+Usage:
+  tmi send <pane> <text>         Send input (with escape sequences)
+  tmi read <pane> [options]      Read pane content
+  tmi activity <pane>            Check if content changed
+  tmi wait <pane> [options]      Wait for condition
+  tmi state <pane>               Detect app & state
+
+Escape sequences for send:
+  \e  ESC    \n  Enter    \t  Tab
+  \cX Ctrl+X (e.g. \cC = Ctrl-C)
+  \xHH hex byte    \\  literal backslash
+
+Options for send:
+  --type [N]  Type character by character, N = chars/sec (default: 8)
+
+Examples:
+  tmi send %21 '\e:wq\n'              Vim: ESC :wq Enter
+  tmi send %21 '\eiHello\e'           Vim: insert "Hello", back to normal
+  tmi send %21 --type 12 '\eiHello\e' Type "Hello" like a human
+  tmi send %21 '\cC'                  Send Ctrl-C
+
+Read options:
+  --cursor  Show cursor position (screen + vim file position)
+  --raw     Include trailing blank lines
+  --last N  Only last N lines
+
+Wait options:
+  --contains <str>  Wait for string in output
+  --regex           Treat --contains as regex
+  --line <N>        Check specific line (-1 = last)
+  --timeout <sec>   Timeout (default: 30)
+  --idle            Wait for output to stabilize
+USAGE
+}
+
+# --- Main ---
+
+(( $# == 0 )) && { usage; exit 0; }
+cmd="$1"; shift
+
+case "$cmd" in
+    send)     (( $# < 2 )) && die "usage: tmi send <pane> <text>"; cmd_send "$@" ;;
+    read)     (( $# < 1 )) && die "usage: tmi read <pane>"; cmd_read "$@" ;;
+    activity) (( $# < 1 )) && die "usage: tmi activity <pane>"; cmd_activity "$1" ;;
+    wait)     (( $# < 1 )) && die "usage: tmi wait <pane>"; cmd_wait "$@" ;;
+    state)    (( $# < 1 )) && die "usage: tmi state <pane>"; cmd_state "$1" ;;
+    help|-h|--help) usage ;;
+    *)        die "unknown command: $cmd" ;;
+esac
