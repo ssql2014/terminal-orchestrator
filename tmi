@@ -7,6 +7,7 @@ set -uo pipefail
 TMI_DIR="/tmp/tmi"
 POLL_INTERVAL=0.3
 DEFAULT_TIMEOUT=30
+mkdir -p "$TMI_DIR"
 
 # --- Utilities ---
 
@@ -51,12 +52,13 @@ get_cursor() {
 
 cmd_send() {
     local pane="$1"; shift
-    local typing=0  # chars per second, 0 = instant
+    local typing=${TMI_TYPE_SPEED:-0}  # chars per second, 0 = instant
 
     # Parse options before text
     while [[ "${1:-}" == --* ]]; do
         case "$1" in
-            --type)   typing="${2:-8}"; shift 2 ;;
+            --type)   typing="${2:-50}"; shift 2 ;;
+            --instant) typing=0; shift ;;
             *) die "send: unknown option '$1'" ;;
         esac
     done
@@ -72,13 +74,19 @@ cmd_send() {
         if [[ -n "$buf" ]]; then
             if (( typing > 0 )); then
                 # Character-by-character with delay
-                local j
+                local j ch
                 for (( j=0; j<${#buf}; j++ )); do
-                    tmux send-keys -t "$pane" -l "${buf:$j:1}"
+                    ch="${buf:$j:1}"
+                    printf '%s' "$ch" > "$TMI_DIR/.sendbuf"
+                    tmux load-buffer "$TMI_DIR/.sendbuf"
+                    tmux paste-buffer -t "$pane" -d
                     sleep "$type_delay"
                 done
             else
-                tmux send-keys -t "$pane" -l "$buf"
+                # Use load-buffer to avoid shell metachar issues (; etc)
+                printf '%s' "$buf" > "$TMI_DIR/.sendbuf"
+                tmux load-buffer "$TMI_DIR/.sendbuf"
+                tmux paste-buffer -t "$pane" -d
                 sleep 0.02
             fi
             buf=""
@@ -108,7 +116,9 @@ cmd_send() {
                     if (( i + 3 < len )); then
                         _flush
                         local hex="${text:$((i+2)):2}"
-                        tmux send-keys -t "$pane" -l "$(printf "\\x$hex")"
+                        printf "\\x$hex" > "$TMI_DIR/.sendbuf"
+                        tmux load-buffer "$TMI_DIR/.sendbuf"
+                        tmux paste-buffer -t "$pane" -d
                         (( typing > 0 )) && sleep "$type_delay" || sleep 0.02
                         (( i += 4 )); continue
                     fi ;;

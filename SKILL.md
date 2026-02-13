@@ -59,6 +59,7 @@ Parse by splitting on `.` for the address parts and `@` for the host. Like email
 **Setup**: Run once per session, then use `tmi` directly:
 ```
 export PATH="$PATH:$HOME/.claude/skills/terminal-orchestrator"
+export TMI_TYPE_SPEED=50   # Default: type char-by-char at 50 chars/sec
 ```
 
 ### Commands
@@ -84,9 +85,10 @@ export PATH="$PATH:$HOME/.claude/skills/terminal-orchestrator"
 
 ### Typing effect
 
-`--type N` sends text character-by-character at N chars/sec:
+By default (with `TMI_TYPE_SPEED=50`), all `tmi send` output types character-by-character like a fast human. Override per-call:
 ```
-tmi send %21 --type 20 '\eiHello world!\e'
+tmi send %21 --type 20 '\eiSlow typing\e'   # 20 chars/sec
+tmi send %21 --instant '\e:wq\n'             # Instant (for commands)
 ```
 
 ### Activity detection (saves tokens)
@@ -275,7 +277,7 @@ When listing all agents, **filter out grouped sessions** to avoid duplicates —
 2. **Use grouped sessions** for independent views of the same tmux session.
 3. **Use `tmux send-keys`** over AppleScript keystrokes for text input — AppleScript keystrokes go to wrong windows.
 4. **AppleScript only for window management** (create, find, focus), not for typing.
-5. **Always use `-l` flag** with `send-keys` for literal text (prevents special char interpretation).
+5. **Prefer `load-buffer` + `paste-buffer`** over `send-keys -l` for text containing shell metacharacters (`;`, `|`, `&`, `>`, etc.). The `tmi` tool does this automatically.
 6. **Always verify after send** — check pane content to confirm the command ran.
 
 ### Common pitfalls
@@ -286,6 +288,7 @@ When listing all agents, **filter out grouped sessions** to avoid duplicates —
 | Text sent to wrong pane | Ambiguous target name | Use exact `%N` pane ID or `=session:=window` |
 | Multi-line prompt not submitted | Escape delay too short | Use 500ms for Claude multi-line |
 | Multi-line text garbled | Used `send-keys -l` with newlines | Use `load-buffer` + `paste-buffer` |
+| Semicolons `;` lost in text | `send-keys -l` passes through shell which interprets `;` | Use `load-buffer` + `paste-buffer` (tmi does this) |
 | Gemini can't write files | Sandbox restriction | Start Gemini from the target working directory |
 | AppleScript sends to wrong window | Focus race condition | Use tmux instead |
 
