@@ -52,18 +52,81 @@ Parse by splitting on `.` for the address parts and `@` for the host. Like email
 
 ---
 
+## tmi — Unified tmux Interaction Tool
+
+`tmi` (`~/bin/tmi`) wraps common tmux operations into single commands with built-in escape handling, timing, change detection, and state parsing. **Prefer tmi over raw tmux commands** for pane interaction.
+
+### Commands
+
+| Command | What it does | Example |
+|---------|-------------|---------|
+| `tmi send <pane> <text>` | Send input with escape sequences | `tmi send %21 '\e:wq\n'` |
+| `tmi read <pane> [opts]` | Read pane content + cursor position | `tmi read %21 --cursor` |
+| `tmi activity <pane>` | Check if content changed (md5 hash) | `tmi activity %21` → changed/unchanged |
+| `tmi wait <pane> [opts]` | Block until condition met | `tmi wait %21 --contains '> ' --timeout 30` |
+| `tmi state <pane>` | Detect app + mode + cursor | `tmi state %21` → `app=vim mode=insert ...` |
+
+### Escape sequences for send
+
+| Sequence | Key | Example |
+|----------|-----|---------|
+| `\e` | ESC | `\e:wq\n` = ESC :wq Enter |
+| `\n` | Enter | |
+| `\t` | Tab | |
+| `\cX` | Ctrl+X | `\cC` = Ctrl-C |
+| `\xHH` | Hex byte | `\x21` = ! |
+| `\\` | Literal backslash | |
+
+### Typing effect
+
+`--type N` sends text character-by-character at N chars/sec:
+```
+tmi send %21 --type 20 '\eiHello world!\e'
+```
+
+### Activity detection (saves tokens)
+
+```
+tmi activity %21    # → "changed" (exit 0) or "unchanged" (exit 1)
+```
+Uses md5 hash stored in `/tmp/tmi/`. Check activity first, only read when changed.
+
+### Wait for conditions
+
+```
+tmi wait %21 --contains '> ' --timeout 30     # Wait for prompt
+tmi wait %21 --idle --timeout 10               # Wait for output to stabilize
+tmi wait %21 --line -1 --regex --contains 'written|\[w\]'  # Regex match on last line
+```
+
+### State detection
+
+```
+tmi state %21
+# → app=vim mode=normal cursor=3,27 file_pos=3,27
+# → app=shell idle=true cursor=24,1
+# → app=claude busy=true cursor=15,1
+```
+
+Detects: **vim** (normal/insert/visual/replace/command), **shell** (idle/busy), **claude** (idle/busy). Includes screen cursor position from tmux `#{cursor_x}`/`#{cursor_y}`.
+
+---
+
 ## Core Operations
 
 ### How to send, read, list, and kill
 
-All tmux operations work **without focus** via `tmux send-keys`, `tmux capture-pane`, etc. Terminal.app operations require **AppleScript** and steal focus.
+All tmux operations work **without focus** via `tmi` or raw `tmux` commands. Terminal.app operations require **AppleScript** and steal focus.
 
-| Operation | tmux pane | Terminal.app window |
-|-----------|-----------|---------------------|
-| **Send text** | `tmux send-keys -t <target> -l "text"` then `Enter` | AppleScript: set clipboard, activate, Cmd+V, Return |
-| **Read output** | `tmux capture-pane -t <target> -p -S -100` | `osascript -e 'tell app "Terminal" to get contents of selected tab of window 1'` |
-| **List all** | `tmux list-panes -a -F '#{session_name} #{window_name} #{pane_title} #{pane_id}'` | `osascript -e 'tell app "Terminal" to get id of every window'` |
-| **Kill** | `tmux kill-pane -t <id>` / `kill-window` / `kill-session` | Close via AppleScript |
+| Operation | tmux pane (preferred) | tmux pane (raw) | Terminal.app window |
+|-----------|----------------------|-----------------|---------------------|
+| **Send text** | `tmi send <pane> 'text\n'` | `tmux send-keys -t <target> -l "text"` then `Enter` | AppleScript: clipboard, Cmd+V, Return |
+| **Read output** | `tmi read <pane>` | `tmux capture-pane -t <target> -p -S -100` | `osascript` |
+| **Check state** | `tmi state <pane>` | `capture-pane` + pattern match | — |
+| **Wait** | `tmi wait <pane> --contains '> '` | Manual polling loop | — |
+| **Activity** | `tmi activity <pane>` | Manual md5 comparison | — |
+| **List all** | — | `tmux list-panes -a -F '#{session_name} #{window_name} #{pane_title} #{pane_id}'` | `osascript` |
+| **Kill** | — | `tmux kill-pane -t <id>` / `kill-window` / `kill-session` | Close via AppleScript |
 
 **Target syntax**: `session:window.pane_index` or `%N` (direct pane ID). Use `=session:=window` for exact match on session/window names. **Pane titles are NOT native tmux targets** — you must resolve title to `%N` pane ID by listing panes and grepping on `#{pane_title}`. Always resolve to `%N` for reliability.
 
@@ -92,14 +155,16 @@ When using AppleScript clipboard-paste to send text to Terminal.app, **save and 
 
 Different CLI agents need different key sequences to submit input. **Getting this wrong means the prompt is typed but never sent.**
 
-| Agent | Submit Sequence | Notes |
-|-------|-----------------|-------|
-| **Claude Code** | text, then `Escape`, then **500ms delay**, then `Enter` | Escape exits multi-line edit mode. 500ms is critical for multi-line; 100ms OK for single-line |
-| **Gemini CLI** | text, then `Escape`, then 300ms delay, then `Enter` | Also needs Escape |
-| **Codex CLI** | text, then `Enter` | No Escape needed |
-| **OpenCode** | text, then `Enter` | No Escape needed |
-| **Aider** | text, then `Enter` | No Escape needed |
-| **Shell** | text, then `Enter` | Standard |
+| Agent | tmi command | Raw sequence | Notes |
+|-------|-------------|--------------|-------|
+| **Claude Code** | `tmi send %N 'prompt\e\n'` | text → Escape → **500ms** → Enter | 500ms critical for multi-line |
+| **Gemini CLI** | `tmi send %N 'prompt\e\n'` | text → Escape → 300ms → Enter | Also needs Escape |
+| **Codex CLI** | `tmi send %N 'prompt\n'` | text → Enter | No Escape needed |
+| **OpenCode** | `tmi send %N 'prompt\n'` | text → Enter | No Escape needed |
+| **Aider** | `tmi send %N 'prompt\n'` | text → Enter | No Escape needed |
+| **Shell** | `tmi send %N 'command\n'` | text → Enter | Standard |
+
+Note: `tmi send` handles the `\e` → ESC (150ms delay) and `\n` → Enter timing automatically.
 
 ### Multi-line text
 
@@ -148,7 +213,15 @@ Read pane content with `tmux capture-pane` and pattern-match to determine agent 
 
 ### Verification after send
 
-Always check that the command actually executed:
+With tmi:
+```
+tmi activity %21          # Reset hash baseline
+tmi send %21 'prompt\e\n' # Send command
+tmi wait %21 --idle --timeout 5   # Wait for it to process
+tmi activity %21          # "changed" confirms it ran
+```
+
+Without tmi:
 1. Capture pane content **before** sending
 2. Send the text + submit keys
 3. Wait briefly, then capture again
@@ -156,6 +229,13 @@ Always check that the command actually executed:
 
 ### Waiting for completion
 
+With tmi:
+```
+tmi wait %21 --contains '> ' --timeout 60   # Wait for prompt
+tmi wait %21 --idle --timeout 30             # Wait for output to stabilize
+```
+
+Without tmi:
 - **Polling**: Repeatedly capture pane, check if idle pattern appears. Use 3 consecutive idle checks to avoid false positives during brief pauses.
 - **Hash-based change detection**: Compare `md5` of captured content to detect any change.
 - **tmux wait-for**: For shell commands, append `; tmux wait-for -S done` and block on `tmux wait-for done`.
