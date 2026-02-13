@@ -54,9 +54,9 @@ Parse by splitting on `.` for the address parts and `@` for the host. Like email
 
 ## tmi — Unified tmux Interaction Tool
 
-`tmi` is a bash script bundled with this skill (`tmi` in the skill directory). It wraps common tmux operations into single commands with built-in escape handling, timing, change detection, and state parsing. **Prefer tmi over raw tmux commands** for pane interaction.
+`tmi` is a bash script bundled with this skill. It wraps common tmux operations into single commands with built-in escape handling, timing, change detection, and state parsing. **Prefer tmi over raw tmux commands** for pane interaction.
 
-**Setup**: The script is at `~/.claude/skills/terminal-orchestrator/tmi`. Either use the full path or symlink it: `ln -sf ~/.claude/skills/terminal-orchestrator/tmi ~/bin/tmi`
+**Path**: Use as `~/.claude/skills/terminal-orchestrator/tmi` — no install needed. All examples below use `tmi` as shorthand for this full path.
 
 ### Commands
 
