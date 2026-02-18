@@ -1,6 +1,11 @@
 ---
 name: terminal-orchestrator
-description: AI agent orchestration via tmux and Terminal.app. Battle-tested patterns for multi-agent terminal control.
+description: >
+  Use when the user mentions: terminal agents, terminal skill, terminal control, terminal orchestration,
+  tmux agents, tmux panes, tmux orchestration, multi-agent terminal, agent panes, start/send/read/check agents in tmux,
+  or references an address like "workspace.tmux:design", "project.tmux:dev.left", any "<name>.tmux:<window>" pattern.
+  Also use for: launching CLI agents (Claude/Gemini/Codex/Aider) in terminal panes, sending prompts to running agents,
+  reading agent output, checking agent status, coordinating parallel agents, tmi commands, or cleaning up tmux sessions.
 ---
 
 # Terminal & tmux Agent Orchestration
@@ -391,3 +396,57 @@ Executes commands on a remote tmux session via SSH. Address: `cicd.tmux:pipeline
 Kill myproject session and its Terminal windows
 ```
 Terminates the tmux session and closes all associated Terminal.app windows (one-to-one cleanup).
+
+---
+
+## Discord Integration
+
+Agents in tmux panes can communicate with Discord using the `discord` CLI (`~/.local/bin/discord`). Two directions:
+
+### Outbound: Agent → Discord (CLI direct)
+
+Any agent running in a tmux pane can send messages to Discord directly:
+```bash
+discord send general "task complete"
+discord send logs "build passed"
+discord read general --limit 5
+discord thread reply THREAD_ID "update"
+```
+
+Channel aliases (general, logs, etc.) are defined in `~/.config/discord-cli/config.json`.
+
+### Inbound: Discord → Agent (gateway bridge)
+
+Run `discord gateway` to bridge a Discord channel to an interactive agent in a tmux pane:
+```bash
+# Bridge Discord #general → agent in tmux pane
+discord gateway general --pane SESSION:WINDOW --mention-only --account mybot
+```
+
+The gateway:
+1. Connects to Discord WebSocket, receives messages
+2. Types each message into the tmux pane via `tmux send-keys`
+3. Waits for the agent's response (output stabilizes)
+4. Sends the response back to Discord as a reply
+
+### Full bidirectional setup
+
+```bash
+# 1. Start agents in tmux
+tmux new-session -d -s myproject -n agent
+tmi send SESSION:WINDOW 'claude\n'
+
+# 2. Bridge Discord → agent pane (run in a separate pane or background)
+discord gateway general --pane SESSION:WINDOW --mention-only --account mybot
+
+# 3. Agent can send to Discord proactively from within its pane:
+#    discord send general "I finished the task"
+```
+
+### Replacing openclaw message commands
+
+| Old (openclaw) | New (discord CLI) |
+|---------------|-------------------|
+| `openclaw message send --account lily --channel discord --target channel:ID --message "text"` | `discord send <alias-or-ID> "text" --account lily` |
+| `openclaw message read --channel discord --target channel:ID --limit 5` | `discord read <alias-or-ID> --limit 5` |
+| `openclaw message send ... --target thread:ID --message "text"` | `discord thread reply <thread-ID> "text"` |
