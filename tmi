@@ -2,6 +2,9 @@
 # tmi — tmux interaction toolkit for AI agents
 # Unified interface: send input, read output, detect changes & app state
 
+# Ensure standard tools are on PATH (Claude Code sandbox may have a minimal PATH)
+export PATH="/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:$PATH"
+
 set -uo pipefail
 
 TMI_DIR="/tmp/tmi"
