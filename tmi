@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 # tmi — tmux interaction toolkit for AI agents
 # Unified interface: send input, read output, detect changes & app state
 
