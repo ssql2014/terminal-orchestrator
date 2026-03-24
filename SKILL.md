@@ -171,12 +171,22 @@ Different CLI agents need different key sequences to submit input. **Getting thi
 |-------|-------------|--------------|-------|
 | **Claude Code** | `tmi send %N 'prompt\e\n'` | text → Escape → **500ms** → Enter | 500ms critical for multi-line |
 | **Gemini CLI** | `tmi send %N 'prompt\e\n'` | text → Escape → 300ms → Enter | Also needs Escape |
-| **Codex CLI** | `tmi send %N 'prompt\n'` | text → Enter | No Escape needed |
+| **Codex CLI** | `codex_send_checked.sh %N 'prompt'` | text → true Enter keystroke, then verify | Preferred. This helper now lives in the skill repo beside `tmi`. It sends text first, then issues a real `\n` Enter keystroke through `tmi` instead of pasting a literal newline character. It verifies real post-submit activity, retries cold-start with bare `\n`, and if Codex queued the message it sends `Escape` to interrupt and submit immediately. Prompt echo alone is not treated as success. |
 | **OpenCode** | `tmi send %N 'prompt\n'` | text → Enter | No Escape needed |
 | **Aider** | `tmi send %N 'prompt\n'` | text → Enter | No Escape needed |
 | **Shell** | `tmi send %N 'command\n'` | text → Enter | Standard |
 
 Note: `tmi send` handles the `\e` → ESC (150ms delay) and `\n` → Enter timing automatically.
+
+**Codex cold-start quirk**: right after a fresh `codex` launch or `tmux respawn-pane`, the UI may render before the input widget is fully ready. In that state, `tmi send %N 'prompt\n'` can leave the prompt visible in the transcript without actually starting work. If this happens:
+1. Do **not** send `Escape` (that interrupts Codex).
+2. Wait until the startup banner is fully rendered.
+3. Send one extra bare `\n`.
+4. Verify that Codex entered a working state before sending anything else.
+
+**Codex queued-message quirk**: if Codex is already busy, a new prompt can be left in the UI as queued text with messages like `tab to queue message` or `Messages to be submitted after next tool call`. Do not leave it there unnoticed. Either:
+1. Use `codex_send_checked.sh`, which detects this state and sends `Escape` to interrupt and submit immediately.
+2. Or manually read back the pane after every send and resolve any queued state right away.
 
 ### Multi-line text
 
@@ -199,6 +209,7 @@ Delays are not optional. Without them, keys get combined or lost.
 | `Escape` (single-line) | 100ms | Prevents `Esc+key` being read as `M-key` (Alt) |
 | `Escape` (multi-line) | **500ms** | Claude needs time to process multi-line buffer exit |
 | Text before `Enter` | 50-100ms | Let tmux buffer flush |
+| Codex fresh launch before first retry `Enter` | 200-500ms | Let the Codex input widget become ready after the splash screen |
 | After `paste-buffer` | 200ms | Let tmux buffer sync |
 | After `Ctrl+C` | 200ms | Allow interrupt to process |
 
@@ -232,6 +243,22 @@ tmi send %21 'prompt\e\n' # Send command
 tmi wait %21 --idle --timeout 5   # Wait for it to process
 tmi activity %21          # "changed" confirms it ran
 ```
+
+Codex-specific fallback:
+```
+tmi send %21 'prompt\n'
+tmi wait %21 --idle --timeout 2 || true
+# If Codex shows the prompt text but does not enter a working state:
+tmi send %21 '\n'
+```
+
+Preferred Codex helper:
+```
+codex_send_checked.sh %21 'prompt text here'
+```
+This helper enforces post-send verification and auto-resolves the two failure modes we have hit in practice:
+- cold-start submit swallowed by the input widget not being ready yet
+- queued-but-not-submitted prompt left hanging while Codex is busy
 
 Without tmi:
 1. Capture pane content **before** sending
