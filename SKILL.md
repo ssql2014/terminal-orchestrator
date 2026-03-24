@@ -311,6 +311,9 @@ When listing all agents, **filter out grouped sessions** to avoid duplicates —
 4. **AppleScript only for window management** (create, find, focus), not for typing.
 5. **Prefer `load-buffer` + `paste-buffer`** over `send-keys -l` for text containing shell metacharacters (`;`, `|`, `&`, `>`, etc.). The `tmi` tool does this automatically.
 6. **Always verify after send** — check pane content to confirm the command ran.
+7. **Treat cross-machine session transfer as a three-layer restore problem**: `tmux layout`, `agent session payload`, and `network reachability` are separate.
+8. **Do not assume the target machine can reach the same servers**. Restoring a session on `machine B` does not restore `machine A`'s SSH topology.
+9. **When transferring from one server or workstation to another, restore the local workspace first, then reconnect each remote entry point explicitly** (`SSH`, `VNC`, `RDP`, tunnels, or RustDesk).
 
 ### Common pitfalls
 
@@ -323,6 +326,7 @@ When listing all agents, **filter out grouped sessions** to avoid duplicates —
 | Semicolons `;` lost in text | `send-keys -l` passes through shell which interprets `;` | Use `load-buffer` + `paste-buffer` (tmi does this) |
 | Gemini can't write files | Sandbox restriction | Start Gemini from the target working directory |
 | AppleScript sends to wrong window | Focus race condition | Use tmux instead |
+| Session restored on another Mac but remote hosts still unreachable | The restore only moved local state, not network position | Re-establish remote access separately and document which hosts are reachable from which machine |
 
 ### Recommended tmux.conf
 
