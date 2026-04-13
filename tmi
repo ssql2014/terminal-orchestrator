@@ -280,20 +280,31 @@ cmd_state() {
     content=$(capture_trimmed "$pane")
     local last5
     last5=$(echo "$content" | tail -5)
+    local last12
+    last12=$(echo "$content" | tail -12)
 
     # Get screen cursor
     local pos cx cy
     pos=$(get_cursor "$pane")
     cx="${pos%% *}" cy="${pos##* }"
+    local pane_dead current_cmd
+    pane_dead=$(tmux display -t "$pane" -p '#{pane_dead}' 2>/dev/null || echo 0)
+    current_cmd=$(tmux display -t "$pane" -p '#{pane_current_command}' 2>/dev/null || echo unknown)
+
+    # --- Dead pane ---
+    if [[ "$pane_dead" == "1" ]]; then
+        echo "app=dead cursor=$((cy+1)),$((cx+1))"
+        return 0
+    fi
 
     # --- Vim ---
-    if echo "$last5" | grep -qE '[0-9]+,[0-9]+(-[0-9]+)?[[:space:]]+(All|Top|Bot|[0-9]+%)'; then
+    if echo "$last5" | grep -qE '[0-9]+,[0-9]+(-[0-9]+)?[[:space:]]+(All|Top|Bot|[0-9]+%)' 2>/dev/null; then
         local mode="normal"
-        if echo "$last5" | grep -qE -- '-- INSERT --'; then
+        if echo "$last5" | grep -qE -- '-- INSERT --' 2>/dev/null; then
             mode="insert"
-        elif echo "$last5" | grep -qE -- '-- VISUAL'; then
+        elif echo "$last5" | grep -qE -- '-- VISUAL' 2>/dev/null; then
             mode="visual"
-        elif echo "$last5" | grep -qE -- '-- REPLACE --'; then
+        elif echo "$last5" | grep -qE -- '-- REPLACE --' 2>/dev/null; then
             mode="replace"
         fi
         # Check command line mode (last line starts with :)
@@ -303,7 +314,7 @@ cmd_state() {
             mode="command"
         fi
         local ruler
-        ruler=$(echo "$last5" | grep -oE '[0-9]+,[0-9]+(-[0-9]+)?' | tail -1)
+        ruler=$(echo "$last5" | grep -oE '[0-9]+,[0-9]+(-[0-9]+)?' 2>/dev/null | tail -1)
         local frow="${ruler%%,*}" fcol="${ruler#*,}"
         fcol="${fcol%%-*}"
         echo "app=vim mode=$mode cursor=$((cy+1)),$((cx+1)) file_pos=$frow,$fcol"
@@ -311,25 +322,45 @@ cmd_state() {
     fi
 
     # --- Claude Code ---
-    if echo "$content" | head -5 | grep -qiE 'claude'; then
+    if echo "$content" | head -5 | grep -qiE 'claude' 2>/dev/null; then
         local busy="false"
-        if echo "$last5" | grep -qE '(⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏|Thinking|working)'; then
+        if echo "$last5" | grep -qE '(⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏|Thinking|working)' 2>/dev/null; then
             busy="true"
         fi
         echo "app=claude busy=$busy cursor=$((cy+1)),$((cx+1))"
         return 0
     fi
 
+    # --- Codex / GPT-5 CLI panes ---
+    local codex_hint="false"
+    if [[ "$current_cmd" == "node" ]] && echo "$content" | grep -qE '(^›|^• |READY:|background terminal running|D-003_PASS|D-003_FAIL|BLOCKER:)' 2>/dev/null; then
+        codex_hint="true"
+    fi
+    if [[ "$codex_hint" == "true" ]] || echo "$content" | grep -qiE 'gpt-5\\.[0-9]|Use /skills to list available skills|Write tests for @filename|Summarize recent commits|Messages to be submitted after next tool call' 2>/dev/null; then
+        local busy="false" idle="false" queued="false"
+        if echo "$content" | grep -qF 'Messages to be submitted after next tool call' 2>/dev/null; then
+            queued="true"
+        fi
+        if echo "$last12" | grep -qE 'Working \\(|Thinking|Galloping|background terminal running|esc to interrupt' 2>/dev/null; then
+            busy="true"
+        fi
+        if [[ "$busy" == "false" ]] && echo "$last12" | grep -qE '^›|gpt-5\\.[0-9].*·' 2>/dev/null; then
+            idle="true"
+        fi
+        echo "app=codex busy=$busy idle=$idle queued=$queued cmd=$current_cmd cursor=$((cy+1)),$((cx+1))"
+        return 0
+    fi
+
     # --- Shell (idle = prompt on last line) ---
     local lastline
-    lastline=$(echo "$content" | tail -1)
-    if echo "$lastline" | grep -qE '(\$|#|❯|➜|>|%)[[:space:]]*$'; then
+    lastline=$(echo "$content" | awk 'NF{line=$0} END{print line}')
+    if echo "$lastline" | grep -qE '(\$|#|❯|➜|>|%)[[:space:]]*$' 2>/dev/null; then
         echo "app=shell idle=true cursor=$((cy+1)),$((cx+1))"
         return 0
     fi
 
     # Shell running a command (prompt visible earlier)
-    if echo "$content" | grep -qE '(\$|#|❯|➜|>|%)[[:space:]]'; then
+    if echo "$content" | grep -qE '(\$|#|❯|➜|>|%)[[:space:]]' 2>/dev/null; then
         echo "app=shell idle=false cursor=$((cy+1)),$((cx+1))"
         return 0
     fi

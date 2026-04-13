@@ -11,12 +11,14 @@ Sends a prompt to a Codex tmux pane and verifies it was actually submitted.
 Default behavior:
 - send prompt + Enter
 - require real post-submit activity, not just prompt echo
-- if Codex cold-start swallowed the first submit, send one extra bare Enter
+- if Codex cold-start swallowed the first submit, send extra bare Enter retries
 - if Codex queued the message instead of submitting it, send Escape to
   interrupt and submit immediately
+- if the prompt is still sitting in the composer, keep nudging it until it
+  enters a real working state or clearly fails
 
 Exit codes:
-- 0: submitted and pane entered working/changed state
+- 0: submitted and pane entered working state
 - 1: prompt still appears queued or unsubmitted after retries
 - 2: bad usage
 EOF
@@ -44,6 +46,19 @@ is_queued() {
     grep -Eq 'tab to queue message|Messages to be submitted after next tool call' <<<"$1"
 }
 
+is_interrupted() {
+    grep -Eq 'Conversation interrupted - tell the model what to do differently' <<<"$1"
+}
+
+has_draft_prompt() {
+    local tail_window="$1"
+    grep -Eq '^[[:space:]]*› ' <<<"$tail_window" &&
+        grep -Eq 'gpt-[0-9]' <<<"$tail_window" &&
+        ! is_working "$tail_window" &&
+        ! is_queued "$tail_window" &&
+        ! is_interrupted "$tail_window"
+}
+
 send_prompt() {
     tmi_cmd send "$pane" --instant "$msg" >/dev/null
     sleep 0.05
@@ -62,51 +77,67 @@ wait_short() {
     sleep "${1:-0.4}"
 }
 
-capture_after_settle() {
-    local first second
-    first="$(capture || true)"
-    wait_short 0.9
-    second="$(capture || true)"
-    printf '%s\n__CODEX_SEND_CHECKED_SPLIT__\n%s' "$first" "$second"
+tail_window() {
+    printf '%s\n' "$1" | tail -n 30
 }
 
 content_before="$(capture || true)"
+current="$content_before"
+prompt_retries=0
+interrupt_retries=0
+
 send_prompt
-wait_short 0.4
-combined="$(capture_after_settle)"
-content="${combined%%$'\n'__CODEX_SEND_CHECKED_SPLIT__*$'\n'*}"
-content_after_wait="${combined#*$'\n'__CODEX_SEND_CHECKED_SPLIT__*$'\n'}"
 
-# Codex cold-start case: prompt echoed but no real follow-up activity yet.
-if ! is_working "$content_after_wait" && ! is_queued "$content_after_wait" && [[ "$content_after_wait" == "$content" ]]; then
-    send_retry_enter
+for _attempt in 1 2 3 4 5 6; do
     wait_short 0.5
-    combined="$(capture_after_settle)"
-    content="${combined%%$'\n'__CODEX_SEND_CHECKED_SPLIT__*$'\n'*}"
-    content_after_wait="${combined#*$'\n'__CODEX_SEND_CHECKED_SPLIT__*$'\n'}"
-fi
+    current="$(capture || true)"
+    current_tail="$(tail_window "$current")"
 
-# Queued-message case: force immediate submission so nothing is left hanging.
-if is_queued "$content_after_wait"; then
-    send_interrupt_submit
-    wait_short 0.6
-    combined="$(capture_after_settle)"
-    content="${combined%%$'\n'__CODEX_SEND_CHECKED_SPLIT__*$'\n'*}"
-    content_after_wait="${combined#*$'\n'__CODEX_SEND_CHECKED_SPLIT__*$'\n'}"
-fi
+    if is_queued "$current_tail"; then
+        if (( interrupt_retries < 2 )); then
+            send_interrupt_submit
+            interrupt_retries=$((interrupt_retries + 1))
+            continue
+        fi
+        echo "status=queued"
+        echo "$current_tail"
+        exit 1
+    fi
 
-if is_queued "$content_after_wait"; then
+    if is_working "$current_tail"; then
+        echo "status=submitted"
+        echo "$current_tail" | tail -n 12
+        exit 0
+    fi
+
+    if is_interrupted "$current_tail"; then
+        echo "status=interrupted"
+        echo "$current_tail" | tail -n 20
+        exit 1
+    fi
+
+    if [[ "$current" == "$content_before" ]] || has_draft_prompt "$current_tail"; then
+        if (( prompt_retries < 3 )); then
+            send_retry_enter
+            prompt_retries=$((prompt_retries + 1))
+            continue
+        fi
+    fi
+done
+
+final_tail="$(tail_window "$current")"
+if is_queued "$final_tail"; then
     echo "status=queued"
-    echo "$content_after_wait" | tail -n 20
+    echo "$final_tail"
     exit 1
 fi
 
-if is_working "$content_after_wait" || [[ "$content_after_wait" != "$content" ]]; then
-    echo "status=submitted"
-    echo "$content_after_wait" | tail -n 12
-    exit 0
+if has_draft_prompt "$final_tail" || [[ "$current" == "$content_before" ]]; then
+    echo "status=not_submitted"
+    echo "$final_tail"
+    exit 1
 fi
 
-echo "status=not_submitted"
-echo "$content_after_wait" | tail -n 20
-exit 1
+echo "status=submitted"
+echo "$final_tail" | tail -n 12
+exit 0

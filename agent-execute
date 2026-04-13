@@ -1,0 +1,403 @@
+#!/usr/bin/env python3
+"""Execute an input against a registered agent hand."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shlex
+import subprocess
+import sys
+import time
+import uuid
+from typing import Any
+
+
+SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
+TMI = os.path.join(SCRIPT_DIR, "tmi")
+CODEX_SEND_CHECKED = os.path.join(SCRIPT_DIR, "codex_send_checked.sh")
+DEFAULT_HOME = os.path.expanduser(os.environ.get("AGENT_HANDS_HOME", "~/.agent-hands"))
+REGISTRY_PATH = os.path.expanduser(
+    os.environ.get("AGENT_HANDS_REGISTRY", os.path.join(DEFAULT_HOME, "registry.json"))
+)
+EVENTS_PATH = os.path.expanduser(
+    os.environ.get("AGENT_HANDS_EVENTS", os.path.join(DEFAULT_HOME, "events.jsonl"))
+)
+
+
+def die(message: str, code: int = 2) -> None:
+    print(f"agent-execute: {message}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def now_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+
+def ensure_parent(path: str) -> None:
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+
+def load_registry() -> dict[str, dict[str, Any]]:
+    if not os.path.exists(REGISTRY_PATH):
+        die(f"registry not found: {REGISTRY_PATH}", 1)
+    with open(REGISTRY_PATH, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if isinstance(data, dict) and "hands" in data and isinstance(data["hands"], dict):
+        return data["hands"]
+    if isinstance(data, dict):
+        return data
+    die(f"registry is not a JSON object: {REGISTRY_PATH}", 1)
+
+
+def save_registry(registry: dict[str, dict[str, Any]]) -> None:
+    ensure_parent(REGISTRY_PATH)
+    tmp = f"{REGISTRY_PATH}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(registry, f, indent=2, sort_keys=True, ensure_ascii=False)
+        f.write("\n")
+    os.replace(tmp, REGISTRY_PATH)
+
+
+def append_event(event: dict[str, Any]) -> None:
+    ensure_parent(EVENTS_PATH)
+    with open(EVENTS_PATH, "a", encoding="utf-8") as f:
+        f.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def run(
+    argv: list[str],
+    *,
+    input_text: str | None = None,
+    timeout: int | None = None,
+    check: bool = False,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        argv,
+        input=input_text,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=timeout,
+        check=check,
+    )
+
+
+def tmux_display(pane: str) -> dict[str, str] | None:
+    fmt = "#{pane_id}\t#{session_name}\t#{window_name}\t#{pane_title}\t#{pane_current_command}\t#{pane_dead}"
+    cp = run(["tmux", "display-message", "-p", "-t", pane, fmt])
+    if cp.returncode != 0:
+        return None
+    parts = cp.stdout.rstrip("\n").split("\t", 5)
+    if len(parts) != 6:
+        return None
+    return {
+        "pane": parts[0],
+        "session": parts[1],
+        "window": parts[2],
+        "pane_title": parts[3],
+        "command": parts[4],
+        "pane_dead": parts[5],
+    }
+
+
+def tmux_list_panes() -> list[dict[str, str]]:
+    fmt = "#{pane_id}\t#{session_name}\t#{window_name}\t#{pane_title}\t#{pane_current_command}\t#{pane_dead}"
+    cp = run(["tmux", "list-panes", "-a", "-F", fmt], check=True)
+    panes: list[dict[str, str]] = []
+    for line in cp.stdout.splitlines():
+        parts = line.split("\t", 5)
+        if len(parts) != 6:
+            continue
+        panes.append(
+            {
+                "pane": parts[0],
+                "session": parts[1],
+                "window": parts[2],
+                "pane_title": parts[3],
+                "command": parts[4],
+                "pane_dead": parts[5],
+            }
+        )
+    return panes
+
+
+def pane_matches(info: dict[str, str], resolve: dict[str, Any]) -> bool:
+    for key in ("session", "window", "pane_title"):
+        expected = resolve.get(key)
+        if expected and info.get(key) != expected:
+            return False
+    return info.get("pane_dead") != "1"
+
+
+def resolve_tmux_pane(
+    hand_name: str, hand: dict[str, Any], registry: dict[str, dict[str, Any]]
+) -> tuple[str, bool, dict[str, str]]:
+    pane = str(hand.get("pane", ""))
+    resolve = hand.get("resolve", {})
+    if not isinstance(resolve, dict):
+        resolve = {}
+
+    if pane:
+        info = tmux_display(pane)
+        if info and (not resolve or pane_matches(info, resolve)):
+            return info["pane"], False, info
+
+    if resolve:
+        matches = [info for info in tmux_list_panes() if pane_matches(info, resolve)]
+        if len(matches) == 1:
+            info = matches[0]
+            hand["pane"] = info["pane"]
+            registry[hand_name] = hand
+            save_registry(registry)
+            return info["pane"], True, info
+        if len(matches) > 1:
+            die(f"multiple tmux panes match hand {hand_name}: {[m['pane'] for m in matches]}", 1)
+
+    if pane:
+        info = tmux_display(pane)
+        if info and info.get("pane_dead") != "1":
+            return info["pane"], False, info
+
+    die(f"tmux pane not found for hand {hand_name}", 1)
+
+
+def tmi_state(pane: str) -> str:
+    cp = run([TMI, "state", pane], timeout=10)
+    return (cp.stdout + cp.stderr).strip()
+
+
+def wait_tmux_idle(pane: str, runtime: str, timeout: int) -> tuple[bool, str]:
+    start = time.time()
+    last_state = ""
+    while True:
+        last_state = tmi_state(pane)
+        if runtime == "codex":
+            if "app=codex" in last_state and "idle=true" in last_state and "busy=true" not in last_state:
+                return True, last_state
+        elif runtime == "claude":
+            if "app=claude" in last_state and "busy=false" in last_state:
+                return True, last_state
+        elif "idle=true" in last_state or "app=shell idle=true" in last_state:
+            return True, last_state
+
+        if timeout > 0 and time.time() - start >= timeout:
+            return False, last_state
+        time.sleep(1.0)
+
+
+def capture_tail(pane: str, lines: int) -> str:
+    cp = run(["tmux", "capture-pane", "-p", "-J", "-S", f"-{lines}", "-t", pane], timeout=10)
+    return cp.stdout.rstrip("\n")
+
+
+def execute_tmux(
+    hand_name: str,
+    hand: dict[str, Any],
+    registry: dict[str, dict[str, Any]],
+    input_text: str,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    pane, registry_updated, info = resolve_tmux_pane(hand_name, hand, registry)
+    runtime = str(hand.get("runtime") or hand.get("type", "").replace("tmux-", "") or "agent")
+    timeout = int(args.timeout or hand.get("timeout_sec") or 300)
+
+    before_state = tmi_state(pane)
+    if not args.no_wait_before:
+        ok, before_state = wait_tmux_idle(pane, runtime, timeout)
+        if not ok:
+            return {
+                "ok": False,
+                "status": "timeout_waiting_for_idle_before_send",
+                "hand": hand_name,
+                "pane": pane,
+                "runtime": runtime,
+                "state": before_state,
+                "registry_updated": registry_updated,
+            }
+
+    if args.dry_run:
+        return {
+            "ok": True,
+            "status": "dry_run",
+            "hand": hand_name,
+            "pane": pane,
+            "runtime": runtime,
+            "state": before_state,
+            "registry_updated": registry_updated,
+        }
+
+    if runtime == "codex" or hand.get("type") == "tmux-codex":
+        send = run([CODEX_SEND_CHECKED, pane, input_text], timeout=timeout)
+    elif runtime in {"claude", "gemini"}:
+        send = run([TMI, "send", pane, "--instant", f"{input_text}\\e\\n"], timeout=timeout)
+    elif runtime == "shell" or hand.get("type") == "tmux-shell":
+        send = run([TMI, "send", pane, "--instant", f"{input_text}\\n"], timeout=timeout)
+    else:
+        send = run([TMI, "send", pane, "--instant", f"{input_text}\\n"], timeout=timeout)
+
+    after_state = tmi_state(pane)
+    wait_ok = True
+    if not args.no_wait_after:
+        wait_ok, after_state = wait_tmux_idle(pane, runtime, timeout)
+
+    return {
+        "ok": send.returncode == 0 and wait_ok,
+        "status": "completed" if wait_ok else "timeout_waiting_for_idle_after_send",
+        "hand": hand_name,
+        "type": hand.get("type"),
+        "pane": pane,
+        "runtime": runtime,
+        "registry_updated": registry_updated,
+        "send_exit_code": send.returncode,
+        "send_stdout_tail": tail(send.stdout, 40),
+        "send_stderr_tail": tail(send.stderr, 40),
+        "state": after_state,
+        "output_tail": tail(capture_tail(pane, 120), 80),
+        "tmux": info,
+    }
+
+
+def execute_helper(hand_name: str, hand: dict[str, Any], input_text: str, args: argparse.Namespace) -> dict[str, Any]:
+    cmd = hand.get("cmd")
+    if not cmd:
+        die(f"helper hand {hand_name} is missing cmd", 1)
+    timeout = int(args.timeout or hand.get("timeout_sec") or 60)
+    argv = shlex.split(str(cmd))
+    if args.dry_run:
+        return {"ok": True, "status": "dry_run", "hand": hand_name, "type": hand.get("type"), "cmd": argv}
+    cp = run(argv, input_text=input_text, timeout=timeout)
+    return {
+        "ok": cp.returncode == 0,
+        "status": "completed",
+        "hand": hand_name,
+        "type": hand.get("type"),
+        "cmd": argv,
+        "exit_code": cp.returncode,
+        "stdout_tail": tail(cp.stdout, 80),
+        "stderr_tail": tail(cp.stderr, 80),
+    }
+
+
+def execute_ssh_shell(hand_name: str, hand: dict[str, Any], input_text: str, args: argparse.Namespace) -> dict[str, Any]:
+    host = hand.get("host")
+    if not host:
+        die(f"ssh-shell hand {hand_name} is missing host", 1)
+    timeout = int(args.timeout or hand.get("timeout_sec") or 60)
+    cwd = hand.get("cwd")
+    remote_cmd = input_text
+    if cwd:
+        remote_cmd = f"cd {shlex.quote(str(cwd))} && {remote_cmd}"
+    argv = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", str(host), remote_cmd]
+    if args.dry_run:
+        return {"ok": True, "status": "dry_run", "hand": hand_name, "type": hand.get("type"), "cmd": argv}
+    cp = run(argv, timeout=timeout)
+    return {
+        "ok": cp.returncode == 0,
+        "status": "completed",
+        "hand": hand_name,
+        "type": hand.get("type"),
+        "host": host,
+        "exit_code": cp.returncode,
+        "stdout_tail": tail(cp.stdout, 80),
+        "stderr_tail": tail(cp.stderr, 80),
+    }
+
+
+def tail(text: str, lines: int) -> str:
+    return "\n".join(text.rstrip("\n").splitlines()[-lines:])
+
+
+def execute(args: argparse.Namespace) -> dict[str, Any]:
+    registry = load_registry()
+    if args.hand not in registry:
+        die(f"hand not found: {args.hand}", 1)
+    hand = registry[args.hand]
+    hand_type = str(hand.get("type", ""))
+    input_text = args.input
+    if input_text == "-":
+        input_text = sys.stdin.read()
+
+    event_id = str(uuid.uuid4())
+    append_event(
+        {
+            "ts": now_iso(),
+            "event": "execute.request",
+            "event_id": event_id,
+            "hand": args.hand,
+            "type": hand_type,
+            "input": input_text,
+            "dry_run": args.dry_run,
+        }
+    )
+
+    try:
+        if hand_type.startswith("tmux-"):
+            result = execute_tmux(args.hand, hand, registry, input_text, args)
+        elif hand_type == "helper":
+            result = execute_helper(args.hand, hand, input_text, args)
+        elif hand_type == "ssh-shell":
+            result = execute_ssh_shell(args.hand, hand, input_text, args)
+        else:
+            die(f"unsupported hand type for {args.hand}: {hand_type}", 1)
+    except subprocess.TimeoutExpired as exc:
+        result = {
+            "ok": False,
+            "status": "timeout",
+            "hand": args.hand,
+            "type": hand_type,
+            "cmd": exc.cmd,
+            "timeout": exc.timeout,
+        }
+    except Exception as exc:
+        result = {
+            "ok": False,
+            "status": "error",
+            "hand": args.hand,
+            "type": hand_type,
+            "error_type": type(exc).__name__,
+            "error": str(exc),
+        }
+
+    result["event_id"] = event_id
+    append_event(
+        {
+            "ts": now_iso(),
+            "event": "execute.result",
+            "event_id": event_id,
+            "hand": args.hand,
+            "type": hand_type,
+            "ok": result.get("ok"),
+            "status": result.get("status"),
+            "result": result,
+        }
+    )
+    return result
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="agent-execute",
+        description="Execute input against a registered agent hand.",
+    )
+    parser.add_argument("hand")
+    parser.add_argument("input", nargs="?", default="-", help="input text, or '-' for stdin")
+    parser.add_argument("--timeout", type=int, help="override hand timeout in seconds")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--no-wait-before", action="store_true")
+    parser.add_argument("--no-wait-after", action="store_true")
+    return parser
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+    result = execute(args)
+    print(json.dumps(result, indent=2, sort_keys=True, ensure_ascii=False))
+    raise SystemExit(0 if result.get("ok") else 1)
+
+
+if __name__ == "__main__":
+    main()

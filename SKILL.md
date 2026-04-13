@@ -124,6 +124,26 @@ Detects: **vim** (normal/insert/visual/replace/command), **shell** (idle/busy), 
 
 ---
 
+## Managed Hand Interface
+
+Use `agent-hand` and `agent-execute` when a workflow needs a stable Anthropic-style `execute(hand_name, input)` layer above raw tmux panes. This is optional; existing `tmi` and `codex_send_checked.sh` flows still work and remain the lower-level escape hatch.
+
+Hands are stored in `~/.agent-hands/registry.json`; calls append request/result events to `~/.agent-hands/events.jsonl`.
+
+```
+agent-hand add evas.ada --type tmux-codex --runtime codex --pane %21 --session evas --window main --pane-title codex-ada-pm --role PM
+agent-hand discover-tmux --namespace evas --session evas
+agent-hand list
+agent-hand show evas.ada
+agent-execute evas.ada "Check Evas status and decide the next action"
+```
+
+`agent-execute` resolves the hand name to the current pane, verifies or repairs stale pane IDs using `session/window/pane_title`, waits for the target to be idle, sends the input, optionally waits for idle again, and records the result. Supported hand types for the first local implementation: `tmux-codex`, `tmux-claude`, `tmux-gemini`, `tmux-shell`, `tmux-agent`, `helper`, and `ssh-shell`.
+
+Use stable hand names such as `evas.ada`, `evas.leo`, `nuc.shell`, or `discord.agent_discussion`. Do not use `%21` directly in higher-level workflows unless you are doing low-level debugging.
+
+---
+
 ## Core Operations
 
 ### How to send, read, list, and kill
@@ -153,6 +173,34 @@ To launch a command at an address:
 4. Send the command (`send-keys -l "command"` + `Enter`)
 5. Optionally create a grouped session and open a Terminal.app window attached to it via AppleScript
 
+### Role-based team setup
+
+When rebuilding a multi-agent tmux team, prefer a non-destructive handoff:
+
+1. Preserve old agents by renaming the existing window to `archive-YYYYMMDD` and setting each old pane title to `archive-YYYYMMDD-<old-role>`.
+2. Register old panes under archive hands such as `<project>.archive.<role>`, then remove only their active aliases.
+3. Create a fresh active window such as `<project>:active`, split the panes, and assign stable role names before launching agents.
+4. Register active hands by role, e.g. `<project>.pm`, `<project>.advisor`, `<project>.arch`, `<project>.evaluator`, `<project>.research`.
+5. Verify with both `tmux list-panes` and `agent-hand list`; do not trust stale `%N` values after pane creation, respawn, or app startup.
+
+Pane titles have two jobs and should be handled separately:
+
+- Machine-readable resolution: set `#{pane_title}` with `tmux select-pane -T <stable-title>` and register it via `agent-hand add --pane-title <stable-title>`.
+- Human-visible labels: many TUIs (Codex, Gemini, Claude) can overwrite `#{pane_title}` via terminal title escape sequences. For stable on-screen labels, set pane-local options and border formatting:
+
+```sh
+tmux set-option -pt %43 @agent_title 'PM Claude Sonnet'
+tmux set-window-option -t project:active pane-border-status top
+tmux set-window-option -t project:active pane-border-format '#[bold]#{pane_index}: #{@agent_title}#[default]  #{pane_id}'
+```
+
+Startup gotchas:
+
+- Do not type a launch command into an existing TUI prompt; it may become queued user text instead of a shell command. Use a fresh shell pane or `tmux respawn-pane -k` on a known pane.
+- After any `split-window`, `swap-pane`, `respawn-pane`, or failed launch, immediately re-run `tmux list-panes`; do not continue using precomputed pane IDs.
+- For nonstandard layouts, inspect `#{window_layout}` after a known-good manual/scripted layout. Literal `tmux select-layout` strings require the checksum prefix; invalid layout strings fail silently if hidden behind `|| true`.
+- Clarify "vertical split": in tmux, vertical split often means left/right columns; ask or verify when a user says "下面竖排" vs "垂直方向 split".
+
 ### How to open a Terminal.app window for a tmux session
 
 Use AppleScript to find an existing window by custom title, or create a new one running `tmux attach -t <grouped_session>`. Set the custom title to `session.type:window` for identification. Always use **separate windows**, never programmatic tabs.
@@ -171,7 +219,7 @@ Different CLI agents need different key sequences to submit input. **Getting thi
 |-------|-------------|--------------|-------|
 | **Claude Code** | `tmi send %N 'prompt\e\n'` | text → Escape → **500ms** → Enter | 500ms critical for multi-line |
 | **Gemini CLI** | `tmi send %N 'prompt\e\n'` | text → Escape → 300ms → Enter | Also needs Escape |
-| **Codex CLI** | `codex_send_checked.sh %N 'prompt'` | text → true Enter keystroke, then verify | Preferred. This helper now lives in the skill repo beside `tmi`. It sends text first, then issues a real `\n` Enter keystroke through `tmi` instead of pasting a literal newline character. It verifies real post-submit activity, retries cold-start with bare `\n`, and if Codex queued the message it sends `Escape` to interrupt and submit immediately. Prompt echo alone is not treated as success. |
+| **Codex CLI** | `codex_send_checked.sh %N 'prompt'` | text → true Enter keystroke, then verify | Preferred. This helper now lives in the skill repo beside `tmi`. It sends text first, then issues a real `\n` Enter keystroke through `tmi` instead of pasting a literal newline character. It now polls multiple times, auto-retries bare `\n` when the prompt is still sitting in the composer, auto-sends `Escape` when Codex queued the message, and only returns success once Codex has actually entered a working state. Prompt echo alone is not treated as success. |
 | **OpenCode** | `tmi send %N 'prompt\n'` | text → Enter | No Escape needed |
 | **Aider** | `tmi send %N 'prompt\n'` | text → Enter | No Escape needed |
 | **Shell** | `tmi send %N 'command\n'` | text → Enter | Standard |

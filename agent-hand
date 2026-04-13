@@ -1,0 +1,285 @@
+#!/usr/bin/env python3
+"""Register stable names for executable agent hands."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from typing import Any
+
+
+DEFAULT_HOME = os.path.expanduser(os.environ.get("AGENT_HANDS_HOME", "~/.agent-hands"))
+REGISTRY_PATH = os.path.expanduser(
+    os.environ.get("AGENT_HANDS_REGISTRY", os.path.join(DEFAULT_HOME, "registry.json"))
+)
+
+
+def die(message: str, code: int = 2) -> None:
+    print(f"agent-hand: {message}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def ensure_parent(path: str) -> None:
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+
+def load_registry() -> dict[str, dict[str, Any]]:
+    if not os.path.exists(REGISTRY_PATH):
+        return {}
+    with open(REGISTRY_PATH, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if isinstance(data, dict) and "hands" in data and isinstance(data["hands"], dict):
+        return data["hands"]
+    if isinstance(data, dict):
+        return data
+    die(f"registry is not a JSON object: {REGISTRY_PATH}")
+
+
+def save_registry(registry: dict[str, dict[str, Any]]) -> None:
+    ensure_parent(REGISTRY_PATH)
+    tmp = f"{REGISTRY_PATH}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(registry, f, indent=2, sort_keys=True, ensure_ascii=False)
+        f.write("\n")
+    os.replace(tmp, REGISTRY_PATH)
+
+
+def sanitize_name(value: str) -> str:
+    value = value.strip().lower()
+    value = re.sub(r"[^a-z0-9_.-]+", "-", value)
+    value = re.sub(r"-+", "-", value).strip("-")
+    return value or "unnamed"
+
+
+def infer_runtime(title: str, command: str) -> str:
+    haystack = f"{title} {command}".lower()
+    if "codex" in haystack:
+        return "codex"
+    if "gemini" in haystack:
+        return "gemini"
+    if "claude" in haystack or command == "2.1.94":
+        return "claude"
+    if command in {"zsh", "bash", "sh", "-zsh", "/bin/zsh"}:
+        return "shell"
+    return "agent"
+
+
+def tmux_type_for_runtime(runtime: str) -> str:
+    if runtime in {"codex", "claude", "gemini", "shell"}:
+        return f"tmux-{runtime}"
+    return "tmux-agent"
+
+
+def role_from_title(title: str) -> str:
+    slug = sanitize_name(title)
+    parts = slug.split("-")
+    for candidate in ("ada", "leo", "mia", "max", "ivy", "ops", "gemini", "legacy"):
+        if candidate in parts:
+            return candidate
+    if slug.startswith("codex-"):
+        slug = slug[len("codex-") :]
+    return slug
+
+
+def tmux_list_panes(session_filter: str | None) -> list[dict[str, str]]:
+    fmt = "#{session_name}\t#{window_name}\t#{pane_id}\t#{pane_title}\t#{pane_current_command}"
+    cmd = ["tmux", "list-panes", "-a", "-F", fmt]
+    try:
+        out = subprocess.check_output(cmd, text=True)
+    except subprocess.CalledProcessError as exc:
+        die(f"tmux list-panes failed: {exc}")
+    panes: list[dict[str, str]] = []
+    for line in out.splitlines():
+        parts = line.split("\t", 4)
+        if len(parts) != 5:
+            continue
+        session, window, pane, title, command = parts
+        if session_filter and session != session_filter:
+            continue
+        panes.append(
+            {
+                "session": session,
+                "window": window,
+                "pane": pane,
+                "pane_title": title,
+                "command": command,
+            }
+        )
+    return panes
+
+
+def print_table(rows: list[tuple[str, str, str, str, str, str]]) -> None:
+    if not rows:
+        return
+    widths = [max(len(row[i]) for row in rows) for i in range(len(rows[0]))]
+    for row in rows:
+        print("  ".join(row[i].ljust(widths[i]) for i in range(len(row))))
+
+
+def cmd_list(_: argparse.Namespace) -> None:
+    registry = load_registry()
+    rows = [("NAME", "TYPE", "TARGET", "RUNTIME", "ROLE", "RESOLVE")]
+    for name in sorted(registry):
+        hand = registry[name]
+        resolve = hand.get("resolve", {})
+        target = hand.get("pane") or hand.get("host") or hand.get("cmd") or ""
+        resolve_text = ""
+        if isinstance(resolve, dict):
+            resolve_text = "/".join(
+                str(resolve.get(key, "")) for key in ("session", "window", "pane_title")
+            ).strip("/")
+        rows.append(
+            (
+                name,
+                str(hand.get("type", "")),
+                str(target),
+                str(hand.get("runtime", "")),
+                str(hand.get("role", "")),
+                resolve_text,
+            )
+        )
+    print_table(rows)
+
+
+def cmd_show(args: argparse.Namespace) -> None:
+    registry = load_registry()
+    if args.name not in registry:
+        die(f"hand not found: {args.name}", 1)
+    print(json.dumps(registry[args.name], indent=2, sort_keys=True, ensure_ascii=False))
+
+
+def cmd_remove(args: argparse.Namespace) -> None:
+    registry = load_registry()
+    if args.name not in registry:
+        die(f"hand not found: {args.name}", 1)
+    del registry[args.name]
+    save_registry(registry)
+    print(f"removed {args.name}")
+
+
+def cmd_add(args: argparse.Namespace) -> None:
+    registry = load_registry()
+    hand: dict[str, Any] = {"type": args.type}
+    if args.runtime:
+        hand["runtime"] = args.runtime
+    if args.role:
+        hand["role"] = args.role
+    if args.pane:
+        hand["pane"] = args.pane
+    if args.host:
+        hand["host"] = args.host
+    if args.cwd:
+        hand["cwd"] = args.cwd
+    if args.cmd:
+        hand["cmd"] = args.cmd
+    if args.timeout_sec:
+        hand["timeout_sec"] = args.timeout_sec
+    if args.policy:
+        hand["policy"] = args.policy
+    if args.idle_policy:
+        hand["idle_policy"] = args.idle_policy
+    if args.allow:
+        hand["allow"] = args.allow
+
+    resolve = {
+        "session": args.session,
+        "window": args.window,
+        "pane_title": args.pane_title,
+    }
+    resolve = {k: v for k, v in resolve.items() if v}
+    if resolve:
+        hand["resolve"] = resolve
+
+    registry[args.name] = hand
+    save_registry(registry)
+    print(f"registered {args.name} -> {hand.get('type')}")
+
+
+def cmd_discover_tmux(args: argparse.Namespace) -> None:
+    registry = load_registry()
+    panes = tmux_list_panes(args.session)
+    updated: list[str] = []
+    for pane in panes:
+        title = pane["pane_title"].strip()
+        if not title:
+            continue
+        runtime = infer_runtime(title, pane["command"])
+        role = role_from_title(title)
+        hand_name = f"{sanitize_name(args.namespace)}.{role}"
+        hand: dict[str, Any] = {
+            "type": tmux_type_for_runtime(runtime),
+            "runtime": runtime,
+            "role": role,
+            "pane": pane["pane"],
+            "resolve": {
+                "session": pane["session"],
+                "window": pane["window"],
+                "pane_title": title,
+            },
+        }
+        registry[hand_name] = hand
+        updated.append(hand_name)
+    save_registry(registry)
+    for name in sorted(updated):
+        print(f"registered {name}")
+    if not updated:
+        print("no tmux panes discovered")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="agent-hand",
+        description="Manage stable hand names for terminal-orchestrator.",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("list").set_defaults(func=cmd_list)
+
+    show = sub.add_parser("show")
+    show.add_argument("name")
+    show.set_defaults(func=cmd_show)
+
+    remove = sub.add_parser("remove")
+    remove.add_argument("name")
+    remove.set_defaults(func=cmd_remove)
+
+    add = sub.add_parser("add")
+    add.add_argument("name")
+    add.add_argument("--type", required=True)
+    add.add_argument("--runtime")
+    add.add_argument("--role")
+    add.add_argument("--pane")
+    add.add_argument("--session")
+    add.add_argument("--window")
+    add.add_argument("--pane-title")
+    add.add_argument("--host")
+    add.add_argument("--cwd")
+    add.add_argument("--cmd")
+    add.add_argument("--timeout-sec", type=int)
+    add.add_argument("--policy")
+    add.add_argument("--idle-policy")
+    add.add_argument("--allow", action="append")
+    add.set_defaults(func=cmd_add)
+
+    discover = sub.add_parser("discover-tmux")
+    discover.add_argument("--namespace", required=True)
+    discover.add_argument("--session")
+    discover.set_defaults(func=cmd_discover_tmux)
+
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
