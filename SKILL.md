@@ -1,11 +1,9 @@
 ---
 name: terminal-orchestrator
 description: >
-  Use when the user mentions: terminal agents, terminal skill, terminal control, terminal orchestration,
-  tmux agents, tmux panes, tmux orchestration, multi-agent terminal, agent panes, start/send/read/check agents in tmux,
-  or references an address like "workspace.tmux:design", "project.tmux:dev.left", any "<name>.tmux:<window>" pattern.
-  Also use for: launching CLI agents (Claude/Gemini/Codex/Aider) in terminal panes, sending prompts to running agents,
-  reading agent output, checking agent status, coordinating parallel agents, tmi commands, or cleaning up tmux sessions.
+  Use when the user mentions terminal agents, terminal control, tmux panes, tmux orchestration,
+  multi-agent terminals, agent panes, starting/sending/reading/checking/closing panes,
+  remote tmux, SSH attach, or addresses like "workspace.tmux:dev.left@host".
 ---
 
 # Terminal & tmux Agent Orchestration
@@ -32,6 +30,40 @@ Examples:
 - `myproject.terminal:debug` — standalone Terminal.app window
 
 Parse by splitting on `.` for the address parts and `@` for the host. Like email: `agent@location`.
+
+---
+
+## Remote Attach Shorthand
+
+Treat compact remote requests as complete orchestration intents. If the user says "open remote tmux on <host>", "attach <host> tmux <session>", or gives an address ending in `@host`, do the SSH login, tmux create/attach, and pane resolution without asking them to spell out each step.
+
+Intent mapping:
+
+| User intent | Meaning |
+|-------------|---------|
+| `open remote tmux on <host> in session <s>` | SSH to `<host>` and `tmux new-session -A -s <s>` |
+| `attach <addr>@<host>` | SSH to `<host>`, ensure session/window/pane exists for `<addr>`, then attach/select it |
+| `start <runtime> at <addr>@<host>` | SSH to `<host>`, create missing tmux session/window/pane, set pane title, launch runtime |
+| `send/read/check <addr>@<host>` | Run the matching `tmi`/tmux operation through SSH after resolving the remote pane |
+| `close <addr>@<host>` | SSH to `<host>` and kill the matching pane/window/session only |
+
+Use the address as the contract. For `project.tmux:work.left@diya33`, ensure remote session `project`, window `work`, and pane title `left`. If any layer is missing, create it; if it exists, reuse it. After creating or closing panes, re-run remote `tmux list-panes` before using pane IDs.
+
+Remote command templates:
+
+```sh
+# Attach/create a remote session interactively
+ssh -t <host> 'tmux new-session -A -s <session>'
+
+# Ensure session and window exist before resolving panes
+ssh <host> 'tmux has-session -t <session> 2>/dev/null || tmux new-session -d -s <session> -n <window>'
+ssh <host> 'tmux list-windows -t <session> -F "#{window_name}" | grep -Fx -- "<window>" >/dev/null || tmux new-window -t <session> -n <window>'
+
+# List/resolve panes on the remote host
+ssh <host> 'tmux list-panes -a -F "#{session_name}\t#{window_name}\t#{pane_title}\t#{pane_id}"'
+```
+
+Do not make the user provide a long sentence for "SSH to host, attach/create tmux, select pane." A short host plus session/window/pane intent is enough.
 
 ---
 
@@ -66,6 +98,10 @@ Parse by splitting on `.` for the address parts and `@` for the host. Like email
 export PATH="$PATH:$HOME/.claude/skills/terminal-orchestrator"
 export TMI_TYPE_SPEED=50   # Default: type char-by-char at 50 chars/sec
 ```
+
+Bundled checked senders:
+- `codex_send_checked.sh` for Codex panes
+- `claude_send_checked.sh` for Claude/Gemini panes
 
 ### Commands
 
@@ -116,11 +152,12 @@ tmi wait %21 --line -1 --regex --contains 'written|\[w\]'  # Regex match on last
 ```
 tmi state %21
 # → app=vim mode=normal cursor=3,27 file_pos=3,27
-# → app=shell idle=true cursor=24,1
+# → app=codex idle=true busy=false cursor=24,1
 # → app=claude busy=true cursor=15,1
+# → app=gemini busy=false cursor=20,1
 ```
 
-Detects: **vim** (normal/insert/visual/replace/command), **shell** (idle/busy), **claude** (idle/busy). Includes screen cursor position from tmux `#{cursor_x}`/`#{cursor_y}`.
+Detects: **vim** (normal/insert/visual/replace/command), **codex** (idle/busy), **claude** (busy), **gemini** (busy), **shell** (idle/busy), **dead** panes. Detection uses pane content plus tmux metadata such as `#{pane_current_command}` and `#{pane_title}`. Includes screen cursor position from tmux `#{cursor_x}`/`#{cursor_y}`.
 
 ---
 
@@ -138,7 +175,7 @@ agent-hand show evas.ada
 agent-execute evas.ada "Check Evas status and decide the next action"
 ```
 
-`agent-execute` resolves the hand name to the current pane, verifies or repairs stale pane IDs using `session/window/pane_title`, waits for the target to be idle, sends the input, optionally waits for idle again, and records the result. Supported hand types for the first local implementation: `tmux-codex`, `tmux-claude`, `tmux-gemini`, `tmux-shell`, `tmux-agent`, `helper`, and `ssh-shell`.
+`agent-execute` resolves the hand name to the current pane, verifies or repairs stale pane IDs using `session/window/pane_title`, waits for the target to be idle, sends the input through the runtime-appropriate checked sender, optionally waits for idle again, and records the result. Supported hand types for the first local implementation: `tmux-codex`, `tmux-claude`, `tmux-gemini`, `tmux-shell`, `tmux-agent`, `helper`, and `ssh-shell`.
 
 Use stable hand names such as `evas.ada`, `evas.leo`, `nuc.shell`, or `discord.agent_discussion`. Do not use `%21` directly in higher-level workflows unless you are doing low-level debugging.
 
@@ -217,14 +254,16 @@ Different CLI agents need different key sequences to submit input. **Getting thi
 
 | Agent | tmi command | Raw sequence | Notes |
 |-------|-------------|--------------|-------|
-| **Claude Code** | `tmi send %N 'prompt\e\n'` | text → Escape → **500ms** → Enter | 500ms critical for multi-line |
-| **Gemini CLI** | `tmi send %N 'prompt\e\n'` | text → Escape → 300ms → Enter | Also needs Escape |
+| **Claude Code** | `claude_send_checked.sh %N 'prompt'` | text → Escape → **500ms** → Enter → verify | Preferred. Retries one bare Enter if submit is swallowed. |
+| **Gemini CLI** | `claude_send_checked.sh --agent gemini %N 'prompt'` | text → Escape → 300ms → Enter → verify | Preferred. Same checked flow, Gemini timing. |
 | **Codex CLI** | `codex_send_checked.sh %N 'prompt'` | text → true Enter keystroke, then verify | Preferred. This helper now lives in the skill repo beside `tmi`. It sends text first, then issues a real `\n` Enter keystroke through `tmi` instead of pasting a literal newline character. It now polls multiple times, auto-retries bare `\n` when the prompt is still sitting in the composer, auto-sends `Escape` when Codex queued the message, and only returns success once Codex has actually entered a working state. Prompt echo alone is not treated as success. |
 | **OpenCode** | `tmi send %N 'prompt\n'` | text → Enter | No Escape needed |
 | **Aider** | `tmi send %N 'prompt\n'` | text → Enter | No Escape needed |
 | **Shell** | `tmi send %N 'command\n'` | text → Enter | Standard |
 
 Note: `tmi send` handles the `\e` → ESC (150ms delay) and `\n` → Enter timing automatically.
+
+**Hard rule**: do not use raw `tmux send-keys`, `load-buffer + paste-buffer + Enter`, or ad hoc `Escape` sequences for agent panes in normal operation. Use the checked sender for that runtime, or `agent-execute`, which chooses the checked sender automatically.
 
 **Codex cold-start quirk**: right after a fresh `codex` launch or `tmux respawn-pane`, the UI may render before the input widget is fully ready. In that state, `tmi send %N 'prompt\n'` can leave the prompt visible in the transcript without actually starting work. If this happens:
 1. Do **not** send `Escape` (that interrupts Codex).
@@ -282,7 +321,37 @@ Read pane content with `tmux capture-pane` and pattern-match to determine agent 
 | **Aider** | `> ` or `>>>` prompt | Diff output | `y/n` question |
 | **OpenCode** | `> ` prompt | Streaming | Confirmation |
 
-### Verification after send
+### MANDATORY: Delivery Verification After Every Send
+
+**Every send to a pane MUST be followed by verification.** This is non-optional. Failure to verify is how messages get stuck silently.
+
+The most common failure modes:
+1. **Multi-line Claude paste stuck**: `load-buffer + paste-buffer` puts text in the input buffer, but `\e\n` submit sequence didn't fire — the text is visible as `[Pasted text #N +M lines]` in the input area but the agent never started processing.
+2. **Codex cold-start swallow**: text was sent but Codex hadn't finished initializing; prompt appears typed but isn't submitted.
+3. **Queued-but-not-submitted Codex prompt**: Codex was busy; prompt queued as pending input.
+
+**Verification procedure after sending to Claude Code pane:**
+```bash
+# Preferred:
+claude_send_checked.sh %PANE 'prompt text here'
+
+# Manual fallback only when debugging:
+# 1. Paste the text
+tmi send %PANE --instant 'prompt text here'
+# 2. Send Escape, wait, then Enter
+tmux send-keys -t %PANE Escape
+sleep 0.5
+tmux send-keys -t %PANE Enter
+# 3. Confirm busy/change
+tmi state %PANE
+tmi read %PANE --last 10
+```
+
+**Critical**: the historic `tmi send %PANE '\e\n'` shortcut is still useful for debugging, but it is no longer the recommended default. The checked sender is the normal path.
+
+**For Codex panes**: always use `codex_send_checked.sh %PANE 'text'` which has built-in verification.
+
+### Verification after send (tmi standard flow)
 
 With tmi:
 ```
@@ -307,6 +376,13 @@ codex_send_checked.sh %21 'prompt text here'
 This helper enforces post-send verification and auto-resolves the two failure modes we have hit in practice:
 - cold-start submit swallowed by the input widget not being ready yet
 - queued-but-not-submitted prompt left hanging while Codex is busy
+
+Preferred Claude/Gemini helper:
+```
+claude_send_checked.sh %23 'prompt text here'
+claude_send_checked.sh --agent gemini %46 'prompt text here'
+```
+This helper enforces the correct Escape-wait-Enter sequence and retries one extra Enter when the first submit is swallowed by the UI/composer.
 
 Without tmi:
 1. Capture pane content **before** sending

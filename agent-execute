@@ -17,6 +17,7 @@ from typing import Any
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 TMI = os.path.join(SCRIPT_DIR, "tmi")
 CODEX_SEND_CHECKED = os.path.join(SCRIPT_DIR, "codex_send_checked.sh")
+CLAUDE_SEND_CHECKED = os.path.join(SCRIPT_DIR, "claude_send_checked.sh")
 DEFAULT_HOME = os.path.expanduser(os.environ.get("AGENT_HANDS_HOME", "~/.agent-hands"))
 REGISTRY_PATH = os.path.expanduser(
     os.environ.get("AGENT_HANDS_REGISTRY", os.path.join(DEFAULT_HOME, "registry.json"))
@@ -181,6 +182,9 @@ def wait_tmux_idle(pane: str, runtime: str, timeout: int) -> tuple[bool, str]:
         elif runtime == "claude":
             if "app=claude" in last_state and "busy=false" in last_state:
                 return True, last_state
+        elif runtime == "gemini":
+            if "app=gemini" in last_state and "busy=false" in last_state:
+                return True, last_state
         elif "idle=true" in last_state or "app=shell idle=true" in last_state:
             return True, last_state
 
@@ -232,8 +236,10 @@ def execute_tmux(
 
     if runtime == "codex" or hand.get("type") == "tmux-codex":
         send = run([CODEX_SEND_CHECKED, pane, input_text], timeout=timeout)
-    elif runtime in {"claude", "gemini"}:
-        send = run([TMI, "send", pane, "--instant", f"{input_text}\\e\\n"], timeout=timeout)
+    elif runtime == "claude":
+        send = run([CLAUDE_SEND_CHECKED, "--agent", "claude", pane, input_text], timeout=timeout)
+    elif runtime == "gemini":
+        send = run([CLAUDE_SEND_CHECKED, "--agent", "gemini", pane, input_text], timeout=timeout)
     elif runtime == "shell" or hand.get("type") == "tmux-shell":
         send = run([TMI, "send", pane, "--instant", f"{input_text}\\n"], timeout=timeout)
     else:

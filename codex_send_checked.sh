@@ -43,17 +43,53 @@ is_working() {
 }
 
 is_queued() {
-    grep -Eq 'tab to queue message|Messages to be submitted after next tool call' <<<"$1"
+    printf '%s\n' "$1" | tail -8 | grep -Eq 'tab to queue message|Messages to be submitted after next tool call'
 }
 
 is_interrupted() {
-    grep -Eq 'Conversation interrupted - tell the model what to do differently' <<<"$1"
+    printf '%s\n' "$1" | tail -8 | grep -Eq 'Conversation interrupted - tell the model what to do differently|Model interrupted to submit steer instructions\.'
+}
+
+has_nonempty_draft_prompt() {
+    awk '
+        /^[[:space:]]*›[[:space:]]*/ {
+            line = $0
+            sub(/^[[:space:]]*›[[:space:]]*/, "", line)
+            if (line ~ /[^[:space:]]/) {
+                found = 1
+            }
+        }
+        END {
+            exit(found ? 0 : 1)
+        }
+    ' <<<"$1"
+}
+
+has_active_draft_prompt() {
+    local tail_window="$1"
+    printf '%s\n' "$tail_window" | tail -8 | awk '
+        /^[[:space:]]*›[[:space:]]*/ {
+            line = $0
+            sub(/^[[:space:]]*›[[:space:]]*/, "", line)
+            if (line ~ /[^[:space:]]/) {
+                prompt = NR
+            }
+        }
+        /gpt-[0-9]|context left|tab to queue message/ {
+            status = NR
+        }
+        END {
+            if (prompt > 0 && status > 0 && prompt < status && (status - prompt) <= 3) {
+                exit 0
+            }
+            exit 1
+        }
+    '
 }
 
 has_draft_prompt() {
     local tail_window="$1"
-    grep -Eq '^[[:space:]]*› ' <<<"$tail_window" &&
-        grep -Eq 'gpt-[0-9]' <<<"$tail_window" &&
+    has_active_draft_prompt "$tail_window" &&
         ! is_working "$tail_window" &&
         ! is_queued "$tail_window" &&
         ! is_interrupted "$tail_window"
